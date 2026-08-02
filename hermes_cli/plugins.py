@@ -86,6 +86,10 @@ class PluginToolOverrideError(PermissionError):
     """
 
 
+class MCPGovernanceRegistrationError(PermissionError):
+    """Raised when a plugin cannot claim one exact MCP server safely."""
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -390,6 +394,16 @@ class PluginManifest:
     key: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class MCPGovernorRegistration:
+    """Immutable manager-owned attribution for one exact server claim."""
+
+    server_name: str
+    plugin_id: str
+    policy: Any = field(repr=False, compare=False)
+    secret_env_names: frozenset[str] = field(default_factory=frozenset)
+
+
 @dataclass
 class LoadedPlugin:
     """Runtime state for a single loaded plugin."""
@@ -400,6 +414,7 @@ class LoadedPlugin:
     hooks_registered: List[str] = field(default_factory=list)
     middleware_registered: List[str] = field(default_factory=list)
     commands_registered: List[str] = field(default_factory=list)
+    mcp_governors_registered: List[str] = field(default_factory=list)
     enabled: bool = False
     error: Optional[str] = None
     # True for a bundled platform plugin recorded as a deferred (not-yet-
@@ -497,6 +512,7 @@ class _PluginManagerState:
             for name, entry in manager._aux_tasks.items()
         }
         self._slack_action_handlers = list(manager._slack_action_handlers)
+        self._mcp_governors = dict(manager._mcp_governors)
         self._discovered = manager._discovered
         self._generation = manager._generation
         self._live_context_generation = manager._live_context_generation
@@ -544,6 +560,7 @@ class _PluginRegistrationView:
             for name, entry in state._aux_tasks.items()
         }
         self._slack_action_handlers = list(state._slack_action_handlers)
+        self._mcp_governors = dict(state._mcp_governors)
         self._discovered = state._discovered
         self._generation = state._generation
         self._live_context_generation = state._live_context_generation
@@ -551,6 +568,7 @@ class _PluginRegistrationView:
         self._lock = threading.RLock()
         self._transaction_tools_registered: List[str] = []
         self._transaction_commands_registered: List[str] = []
+        self._transaction_mcp_governors_registered: List[str] = []
         self._frozen = False
 
     def _record_external_registration(self, surface: str, name: str) -> None:
@@ -584,6 +602,7 @@ class _PluginRegistrationView:
         self._plugin_skills = types.MappingProxyType(dict(self._plugin_skills))
         self._aux_tasks = types.MappingProxyType(dict(self._aux_tasks))
         self._slack_action_handlers = tuple(self._slack_action_handlers)
+        self._mcp_governors = types.MappingProxyType(dict(self._mcp_governors))
         self._frozen = True
 
 
@@ -713,6 +732,7 @@ class _RegistrationTransaction:
             self.manager_view._plugin_skills = {}
             self.manager_view._aux_tasks = {}
             self.manager_view._slack_action_handlers = []
+            self.manager_view._mcp_governors = {}
         self.manager_view._discovered = True
 
         removed_tool_names = (
@@ -1215,6 +1235,97 @@ class PluginContext:
         entries = (cfg.get("plugins") or {}).get("entries") or {}
         entry = entries.get(plugin_id) or {}
         return bool(entry.get("allow_tool_override", False))
+
+    # -- governed MCP registration ----------------------------------------
+
+    def _mcp_governance_allowed(self) -> bool:
+        """Require an exact, explicit operator opt-in for this plugin."""
+
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config()
+            if not isinstance(cfg, dict):
+                return False
+            plugins = cfg.get("plugins")
+            if not isinstance(plugins, dict):
+                return False
+            entries = plugins.get("entries")
+            if not isinstance(entries, dict):
+                return False
+            plugin_id = self.manifest.key or self.manifest.name
+            entry = entries.get(plugin_id)
+            return (
+                isinstance(entry, dict)
+                and entry.get("allow_mcp_governance") is True
+            )
+        except Exception:
+            return False
+
+    def register_mcp_governor(self, exact_server_name: str, policy: Any) -> None:
+        """Claim one exact raw MCP server for a neutral two-phase policy.
+
+        The claim is manager-owned and therefore participates in the same
+        staging, conflict check, atomic commit, force-reload rollback, and read
+        locking as the other plugin registration surfaces.
+        """
+
+        if (
+            not isinstance(exact_server_name, str)
+            or not exact_server_name
+            or exact_server_name != exact_server_name.strip()
+            or any(char in exact_server_name for char in "*?[]")
+            or any(ord(char) < 32 or ord(char) == 127 for char in exact_server_name)
+        ):
+            raise MCPGovernanceRegistrationError(
+                "MCP governor requires one exact non-empty raw server name"
+            )
+        if not self._mcp_governance_allowed():
+            plugin_id = self.manifest.key or self.manifest.name
+            raise MCPGovernanceRegistrationError(
+                f"Plugin {plugin_id!r} requires explicit "
+                "allow_mcp_governance: true operator configuration"
+            )
+        if not callable(getattr(policy, "prepare", None)) or not callable(
+            getattr(policy, "finalize", None)
+        ):
+            raise MCPGovernanceRegistrationError(
+                "MCP governor policy must implement prepare and finalize"
+            )
+
+        plugin_id = self.manifest.key or self.manifest.name
+        registration = MCPGovernorRegistration(
+            server_name=exact_server_name,
+            plugin_id=plugin_id,
+            policy=policy,
+            secret_env_names=_manifest_private_secret_names(self.manifest),
+        )
+        with self._registration_lock:
+            binding = self._registration_binding_locked()
+            target = binding.manager
+            release_live = self._acquire_live_lease(binding)
+            try:
+                with target._lock:
+                    self._ensure_live_locked(binding, target)
+                    existing = target._mcp_governors.get(exact_server_name)
+                    if existing is not None:
+                        raise MCPGovernanceRegistrationError(
+                            "MCP server already has a governor"
+                        )
+                    target._mcp_governors[exact_server_name] = registration
+                    registered = getattr(
+                        target, "_transaction_mcp_governors_registered", None
+                    )
+                    if registered is not None:
+                        registered.append(exact_server_name)
+                    target._generation += 1
+            finally:
+                release_live()
+        logger.debug(
+            "Plugin %s registered MCP governor for exact server %s",
+            self.manifest.name,
+            exact_server_name,
+        )
 
     # -- message injection --------------------------------------------------
 
@@ -2185,6 +2296,9 @@ class PluginManager:
         self._live_context_active: Dict[int, int] = {}
         self._live_context_active_by_thread: Dict[tuple[int, int], int] = {}
         self._live_context_revoking: set[int] = set()
+        # Exact raw MCP server name -> immutable policy attribution. Governors
+        # are absent from the model schema and are read only at invocation.
+        self._mcp_governors: Dict[str, MCPGovernorRegistration] = {}
 
     def _record_external_registration(self, surface: str, name: str) -> None:
         self._plugin_external_names.setdefault(surface, set()).add(name)
@@ -2279,6 +2393,7 @@ class PluginManager:
         self._plugin_skills = state._plugin_skills
         self._aux_tasks = state._aux_tasks
         self._slack_action_handlers = state._slack_action_handlers
+        self._mcp_governors = state._mcp_governors
         self._discovered = state._discovered
         self._live_context_generation = state._live_context_generation
         self._generation = max(self._generation, state._generation) + 1
@@ -2297,6 +2412,7 @@ class PluginManager:
         self._plugin_skills = state._plugin_skills
         self._aux_tasks = state._aux_tasks
         self._slack_action_handlers = state._slack_action_handlers
+        self._mcp_governors = state._mcp_governors
         self._discovered = state._discovered
         self._live_context_generation = state._live_context_generation
         self._generation = state._generation
@@ -2882,6 +2998,9 @@ class PluginManager:
         commands_start = len(
             transaction.manager_view._transaction_commands_registered
         )
+        governors_start = len(
+            transaction.manager_view._transaction_mcp_governors_registered
+        )
         modules_before = (
             _snapshot_module_namespace(module_root) if module_root else {}
         )
@@ -2927,6 +3046,9 @@ class PluginManager:
             ]
             loaded.commands_registered = list(
                 staged._transaction_commands_registered[commands_start:]
+            )
+            loaded.mcp_governors_registered = list(
+                staged._transaction_mcp_governors_registered[governors_start:]
             )
             loaded.enabled = True
             with staged._lock:
@@ -3226,6 +3348,22 @@ class PluginManager:
         with self._lock:
             return set(self._plugin_tool_names), dict(self._plugins)
 
+    def get_mcp_governor(self, exact_server_name: str) -> MCPGovernorRegistration | None:
+        """Return one immutable exact-server registration under the state lock."""
+
+        with self._lock:
+            return self._mcp_governors.get(exact_server_name)
+
+    def get_mcp_governor_attribution(
+        self, exact_server_name: str
+    ) -> str | None:
+        """Return the owning plugin id without exposing mutable manager state."""
+
+        with self._lock:
+            registration = self._mcp_governors.get(exact_server_name)
+            return registration.plugin_id if registration is not None else None
+
+
 # ---------------------------------------------------------------------------
 # Module-level singleton & convenience functions
 # ---------------------------------------------------------------------------
@@ -3248,6 +3386,17 @@ def discover_plugins(force: bool = False) -> None:
     manifests and reload state in the current process.
     """
     get_plugin_manager().discover_and_load(force=force)
+
+
+def get_mcp_governor(
+    exact_server_name: str,
+) -> MCPGovernorRegistration | None:
+    """Read the active exact-server governor from the process manager."""
+
+    manager = _plugin_manager
+    if manager is None:
+        return None
+    return manager.get_mcp_governor(exact_server_name)
 
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:

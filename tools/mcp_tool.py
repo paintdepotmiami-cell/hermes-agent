@@ -4786,7 +4786,15 @@ def _mark_server_call_started(server: Any) -> None:
         mark_tool_call()
 
 
-def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
+def _make_tool_handler(
+    server_name: str,
+    tool_name: str,
+    tool_timeout: float,
+    *,
+    governed_descriptor=None,
+    governed_server=None,
+    governed_session=None,
+):
     """Return a sync handler that calls an MCP tool via the background loop.
 
     The handler conforms to the registry's dispatch interface:
@@ -4794,6 +4802,58 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        # Exact-server governors are selected at invocation so a transactional
+        # plugin load/force-reload never requires rebuilding the model tool
+        # schema. Their handler snapshot, however, is discovery-owned: session
+        # swaps or metadata drift must block instead of silently retargeting.
+        try:
+            from hermes_cli.plugins import get_mcp_governor
+
+            governor = get_mcp_governor(server_name)
+        except Exception:
+            governor = None
+        if governor is not None:
+            if (
+                governed_descriptor is None
+                or governed_server is None
+                or governed_session is None
+            ):
+                return json.dumps(
+                    {
+                        "dispatch_count": 0,
+                        "dispatch_started": False,
+                        "dispatch_tool": None,
+                        "invoked_tool": tool_name,
+                        "operation_hash": None,
+                        "outcome": {
+                            "summary": "governed MCP descriptor snapshot is unavailable"
+                        },
+                        "preflight_completed": False,
+                        "preflight_count": 0,
+                        "preflight_started": False,
+                        "server": server_name,
+                        "status": "blocked",
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            from tools.governed_mcp_dispatch import (
+                _READ_ONLY_PASS_THROUGH,
+                dispatch_governed_mcp,
+            )
+
+            governed_result = dispatch_governed_mcp(
+                registration=governor,
+                descriptor=governed_descriptor,
+                server=governed_server,
+                session=governed_session,
+                arguments=args,
+                tool_timeout=tool_timeout,
+            )
+            if governed_result is not _READ_ONLY_PASS_THROUGH:
+                return governed_result
+
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
         # stops retrying and uses alternative approaches (#10447).
@@ -5763,13 +5823,39 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
 
         _scan_mcp_description(name, mcp_tool.name, mcp_tool.description or "")
         schema = _convert_mcp_schema(name, mcp_tool)
+        try:
+            from tools.governed_mcp_dispatch import build_mcp_tool_descriptor
+
+            governed_descriptor = build_mcp_tool_descriptor(
+                name,
+                schema["name"],
+                mcp_tool,
+            )
+        except Exception as exc:
+            # Keep the established non-governed path tolerant of legacy SDK
+            # stand-ins and malformed servers. A later governor claim will
+            # fail closed because this handler has no canonical snapshot; it
+            # can never turn the metadata failure into governed dispatch.
+            governed_descriptor = None
+            logger.debug(
+                "MCP server '%s': governed metadata unavailable for raw "
+                "tool '%s': %s",
+                name,
+                mcp_tool.name,
+                type(exc).__name__,
+            )
         candidates.append(
             {
                 "registry_name": schema["name"],
                 "origin": f"tool {mcp_tool.name!r}",
                 "schema": schema,
                 "handler": _make_tool_handler(
-                    name, mcp_tool.name, server.tool_timeout
+                    name,
+                    mcp_tool.name,
+                    server.tool_timeout,
+                    governed_descriptor=governed_descriptor,
+                    governed_server=server,
+                    governed_session=server.session,
                 ),
                 "check_fn": check_fn,
             }
