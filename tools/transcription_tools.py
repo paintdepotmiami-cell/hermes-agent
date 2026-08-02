@@ -216,6 +216,13 @@ def _find_ffmpeg_binary() -> Optional[str]:
     return _find_binary("ffmpeg")
 
 
+def _fixed_ffmpeg_child_env() -> dict[str, str]:
+    """Return a parent-env copy after the host-private final deny scrub."""
+    from private_secret_policy import scrub_private_secret_env
+
+    return scrub_private_secret_env(dict(os.environ))
+
+
 def _transcode_audio_for_stt(file_path: str, work_dir: str) -> tuple[Optional[str], Optional[str]]:
     """Transcode ``file_path`` to a compact, broadly-accepted .m4a for STT upload.
 
@@ -237,7 +244,7 @@ def _transcode_audio_for_stt(file_path: str, work_dir: str) -> tuple[Optional[st
         converted_path,
     ]
     try:
-        subprocess.run(command, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
+        subprocess.run(command, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, stdin=subprocess.DEVNULL, env=_fixed_ffmpeg_child_env(), creationflags=windows_hide_flags())
         return converted_path, None
     except subprocess.CalledProcessError as exc:
         details = exc.stderr.strip() or exc.stdout.strip() or str(exc)
@@ -655,12 +662,13 @@ def _terminate_command_stt_process_tree(proc: subprocess.Popen) -> None:
 
 
 def _command_stt_env_passthrough(config: Dict[str, Any]) -> list:
-    """Return the provider's ``env_passthrough`` allowlist (opt-out of scrub).
+    """Return the provider's ``env_passthrough`` allowlist.
 
     Command providers legitimately reference their own API keys in the shell
     template (curl one-liners). The child env is scrubbed of Hermes secrets by
     default; ``env_passthrough: [MY_API_KEY, ...]`` copies the named variables
     back from the parent environment so a trusted template keeps working.
+    Enabled-plugin private names remain non-overridable at the final boundary.
     Mirrors ``tools.tts_tool._command_provider_env_passthrough``.
     """
     raw = config.get("env_passthrough")
@@ -691,6 +699,10 @@ def _run_command_stt(
         value = os.environ.get(key)
         if value is not None:
             scrubbed[key] = value
+    child_env = delegated_child_subprocess_env(scrubbed)
+    from private_secret_policy import scrub_private_secret_env
+
+    child_env = scrub_private_secret_env(child_env or {})
     popen_kwargs: Dict[str, Any] = {
         "shell": True,
         "stdout": subprocess.PIPE,
@@ -700,7 +712,7 @@ def _run_command_stt(
         # must not raise in the reader threads on non-UTF-8 Windows (#45099).
         "encoding": "utf-8",
         "errors": "replace",
-        "env": delegated_child_subprocess_env(scrubbed),
+        "env": child_env,
     }
     if os.name == "nt":
         popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -1691,7 +1703,7 @@ def _prepare_local_audio(file_path: str, work_dir: str) -> tuple[Optional[str], 
     command = [ffmpeg, "-y", "-i", file_path, converted_path]
 
     try:
-        subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
+        subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300, stdin=subprocess.DEVNULL, env=_fixed_ffmpeg_child_env(), creationflags=windows_hide_flags())
         return converted_path, None
     except subprocess.TimeoutExpired:
         logger.error("ffmpeg conversion timed out for %s", file_path)
@@ -1712,6 +1724,7 @@ def _convert_caf_to_wav(file_path: str) -> Optional[str]:
             subprocess.run([ffmpeg, "-y", "-i", file_path, wav_path],
                 check=True, capture_output=True, text=True,
                 timeout=300, stdin=subprocess.DEVNULL,
+                env=_fixed_ffmpeg_child_env(),
                 creationflags=windows_hide_flags())
             return wav_path
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:

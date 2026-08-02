@@ -730,6 +730,9 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
         from tools.environments.local import hermes_subprocess_env
         uv_env = hermes_subprocess_env(inherit_credentials=False)
         uv_env["VIRTUAL_ENV"] = str(venv_root)
+        from private_secret_policy import scrub_private_secret_env
+
+        uv_env = scrub_private_secret_env(uv_env)
 
         # Tier 1: uv (preferred — fast, doesn't need pip in the venv)
         # Managed uv first: $HERMES_HOME/bin is never on PATH, so a bare
