@@ -122,6 +122,36 @@ class TestApprovalCommandWiring:
 
 
 class TestApprovalTextFallbackContract:
+    def test_fresh_approval_preserves_the_entire_bound_preview(self):
+        from gateway.run import _format_exec_approval_fallback
+
+        command = "x" * 200 + "\nTAIL-SENTINEL-MUST-BE-VISIBLE"
+
+        text = _format_exec_approval_fallback(
+            command,
+            "verify the complete operation",
+            "/",
+            allow_permanent=False,
+            allow_session=False,
+            approval_id="fa_exact-preview",
+        )
+
+        assert f"```\n{command}\n```" in text
+
+    def test_legacy_approval_keeps_its_existing_preview_cap(self):
+        from gateway.run import _format_exec_approval_fallback
+
+        command = "x" * 200 + "TAIL-SENTINEL"
+
+        text = _format_exec_approval_fallback(
+            command,
+            "legacy approval",
+            "/",
+        )
+
+        assert f"```\n{'x' * 200}...\n```" in text
+        assert "TAIL-SENTINEL" not in text
+
     def test_smart_deny_only_advertises_one_operation(self):
         from gateway.run import _format_exec_approval_fallback
 

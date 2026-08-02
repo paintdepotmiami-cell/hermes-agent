@@ -851,8 +851,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # Interactive model picker state per chat
         self._model_picker_state: Dict[str, dict] = {}
         self._choice_picker_state: Dict[str, dict] = {}
-        # Approval button state: message_id → session_key
-        self._approval_state: Dict[int, str] = {}
+        # Approval button state: legacy counter or fresh approval_id → session_key
+        self._approval_state: Dict[object, str] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
@@ -5429,41 +5429,73 @@ class TelegramAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        approval_id: Optional[str] = None,
     ) -> SendResult:
         """Send an inline-keyboard approval prompt with interactive buttons.
 
-        The buttons call ``resolve_gateway_approval()`` to unblock the waiting
-        agent thread — same mechanism as the text ``/approve`` flow.
+        Legacy buttons call ``resolve_gateway_approval()``. When an exact
+        ``approval_id`` is supplied, the two fresh buttons instead submit
+        authenticated responder evidence to ``FreshApprovalCoordinator``.
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
         try:
-            text = self._format_exec_approval(command, description, smart_denied)
+            text = self._format_exec_approval(
+                command,
+                description,
+                smart_denied,
+                # The fresh approval grant is bound to the exact preview. If
+                # the resulting Telegram message is too large, the send fails
+                # closed and the gateway's chunking text fallback presents the
+                # complete preview with the exact-ID reply instructions.
+                truncate_command=not bool(approval_id),
+            )
 
             # Resolve thread context for thread replies
             thread_id = self._metadata_thread_id(metadata)
 
-            # We'll use the message_id as part of callback_data to look up session_key
-            # Send a placeholder first, then update — or use a counter.
-            # Simpler: use a monotonic counter to generate short IDs.
-            import itertools
-            if not hasattr(self, "_approval_counter"):
-                self._approval_counter = itertools.count(1)
-            approval_id = next(self._approval_counter)
+            if approval_id:
+                state_id: object = approval_id
+                buttons = [
+                    InlineKeyboardButton(
+                        "✅ Allow Once",
+                        callback_data=f"fa:approve_once:{approval_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Deny",
+                        callback_data=f"fa:deny:{approval_id}",
+                    ),
+                ]
+            else:
+                # Keep the established session/FIFO approval shape unchanged.
+                import itertools
 
-            buttons = [
-                InlineKeyboardButton("✅ Allow Once", callback_data=f"ea:once:{approval_id}")
-            ]
-            if not smart_denied and allow_session:
-                buttons.append(
-                    InlineKeyboardButton("✅ Session", callback_data=f"ea:session:{approval_id}")
-                )
-                if allow_permanent:
-                    buttons.append(
-                        InlineKeyboardButton("✅ Always", callback_data=f"ea:always:{approval_id}")
+                if not hasattr(self, "_approval_counter"):
+                    self._approval_counter = itertools.count(1)
+                state_id = next(self._approval_counter)
+                buttons = [
+                    InlineKeyboardButton(
+                        "✅ Allow Once", callback_data=f"ea:once:{state_id}"
                     )
-            buttons.append(InlineKeyboardButton("❌ Deny", callback_data=f"ea:deny:{approval_id}"))
+                ]
+                if not smart_denied and allow_session:
+                    buttons.append(
+                        InlineKeyboardButton(
+                            "✅ Session", callback_data=f"ea:session:{state_id}"
+                        )
+                    )
+                    if allow_permanent:
+                        buttons.append(
+                            InlineKeyboardButton(
+                                "✅ Always", callback_data=f"ea:always:{state_id}"
+                            )
+                        )
+                buttons.append(
+                    InlineKeyboardButton(
+                        "❌ Deny", callback_data=f"ea:deny:{state_id}"
+                    )
+                )
             # Pair into rows (2x2 for the full set) so labels stay readable on
             # mobile — a single 4-button row truncates to "Allo… / Ses… / …".
             rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
@@ -5491,7 +5523,7 @@ class TelegramAdapter(BasePlatformAdapter):
             msg = await self._send_message_with_thread_fallback(**kwargs)
 
             # Store session_key keyed by approval_id for the callback handler
-            self._approval_state[approval_id] = session_key
+            self._approval_state[state_id] = session_key
 
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -6331,6 +6363,173 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
+        # --- Fresh authenticated approval callbacks (fa:decision:exact-id) ---
+        if data.startswith("fa:"):
+            parts = data.split(":", 2)
+            if len(parts) != 3 or parts[1] not in {"approve_once", "deny"}:
+                await query.answer(text="Invalid approval data.")
+                return
+            decision, approval_id = parts[1], parts[2]
+
+            # Authentication is derived from Telegram's server event before
+            # any responder evidence is minted. Callback data contributes only
+            # the opaque request ID and decision.
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to approve commands.")
+                return
+
+            session_key = self._approval_state.get(approval_id)
+            if not session_key:
+                await query.answer(text="This approval has already been resolved.")
+                return
+
+            trusted_interaction = None
+            trusted_token = None
+            session_tokens = []
+            try:
+                from tools.fresh_approval import (
+                    ConversationBinding,
+                    get_fresh_approval_coordinator,
+                )
+
+                coordinator = get_fresh_approval_coordinator()
+                event_source = self.build_source(
+                    chat_id=str(query_chat_id),
+                    chat_type=(
+                        str(query_chat_type)
+                        if query_chat_type is not None
+                        else "group"
+                    ),
+                    user_id=caller_id,
+                    user_name=query_user_name,
+                    thread_id=(
+                        str(query_thread_id)
+                        if query_thread_id is not None
+                        else None
+                    ),
+                )
+                profile_id = getattr(self, "_hermes_profile_id", None)
+                if not profile_id:
+                    profile_id = event_source.profile
+                if not profile_id:
+                    runner = getattr(self, "gateway_runner", None)
+                    active_profile = getattr(runner, "_active_profile_name", None)
+                    profile_id = active_profile() if callable(active_profile) else "default"
+                runner = getattr(self, "gateway_runner", None)
+                trusted_issuer = getattr(
+                    runner,
+                    "_issue_telegram_trusted_interaction",
+                    None,
+                )
+                if callable(trusted_issuer):
+                    callback_event = MessageEvent(
+                        text="",
+                        source=event_source,
+                        message_id=str(getattr(query, "id", "")),
+                    )
+                    trusted_interaction = trusted_issuer(
+                        callback_event,
+                        session_key,
+                        surface="gateway_approval",
+                        attach=False,
+                    )
+                if trusted_interaction is not None:
+                    from agent._trusted_interaction_issuer import (
+                        _bind_trusted_interaction,
+                        _publish_trusted_interaction,
+                    )
+                    from gateway.session_context import set_session_vars
+
+                    session_tokens = set_session_vars(
+                        platform="telegram",
+                        source=trusted_interaction.surface,
+                        chat_id=trusted_interaction.chat_id,
+                        thread_id=trusted_interaction.thread_id or "",
+                        user_id=trusted_interaction.actor_id,
+                        session_key=trusted_interaction.session_key,
+                        session_id=trusted_interaction.session_id,
+                        message_id=trusted_interaction.message_id,
+                        profile=trusted_interaction.profile_id,
+                    )
+                    _publish_trusted_interaction(trusted_interaction)
+                    trusted_token = _bind_trusted_interaction(
+                        trusted_interaction
+                    )
+                responder = coordinator._mint_authenticated_responder_for_host(
+                    assurance="telegram_authenticated",
+                    principal_id=caller_id,
+                    binding=ConversationBinding(
+                        profile_id=profile_id,
+                        platform="telegram",
+                        channel_id=str(event_source.scope_id or query_chat_id),
+                        chat_id=str(query_chat_id),
+                        session_key=session_key,
+                        session_id=(
+                            trusted_interaction.session_id
+                            if trusted_interaction is not None
+                            else session_key
+                        ),
+                        thread_id=(
+                            str(query_thread_id)
+                            if query_thread_id is not None
+                            else None
+                        ),
+                        actor_id=caller_id,
+                    ),
+                    inbound_id=str(getattr(query, "id", "")),
+                )
+                resolution = coordinator.resolve(
+                    approval_id,
+                    decision=decision,
+                    responder=responder,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Fresh Telegram approval rejected (id=%s): %s",
+                    approval_id,
+                    exc,
+                )
+                await query.answer(text="Approval rejected or expired.")
+                return
+            finally:
+                if trusted_token is not None:
+                    from agent._trusted_interaction_issuer import (
+                        _clear_trusted_interactions,
+                        _reset_trusted_interaction,
+                    )
+
+                    _reset_trusted_interaction(trusted_token)
+                    _clear_trusted_interactions(
+                        interaction=trusted_interaction
+                    )
+                if session_tokens:
+                    from gateway.session_context import clear_session_vars
+
+                    clear_session_vars(session_tokens)
+
+            self._approval_state.pop(approval_id, None)
+            user_display = getattr(query.from_user, "first_name", "User")
+            label = "✅ Approved once" if resolution.outcome == "approved" else "❌ Denied"
+            await query.answer(text=label)
+            try:
+                await query.edit_message_text(
+                    text=self.format_message(f"{label} by {user_display}"),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            if query_chat_id is not None:
+                self.resume_typing_for_chat(str(query_chat_id))
+            return
+
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)
@@ -6368,8 +6567,52 @@ class TelegramAdapter(BasePlatformAdapter):
                 # the command was already denied and will not run (#63501
                 # regression follow-up: 60s waits made stale taps common).
                 try:
+                    from contextlib import nullcontext
                     from tools.approval import resolve_gateway_approval
-                    count = resolve_gateway_approval(session_key, choice)
+
+                    response_scope = nullcontext()
+                    runner = getattr(self, "gateway_runner", None)
+                    response_context = getattr(
+                        type(runner),
+                        "_trusted_telegram_response_context",
+                        None,
+                    )
+                    callback_id = str(getattr(query, "id", ""))
+                    if (
+                        callable(response_context)
+                        and query_chat_id is not None
+                        and callback_id
+                    ):
+                        event_source = self.build_source(
+                            chat_id=str(query_chat_id),
+                            chat_type=(
+                                str(query_chat_type)
+                                if query_chat_type is not None
+                                else "group"
+                            ),
+                            user_id=caller_id,
+                            user_name=query_user_name,
+                            thread_id=(
+                                str(query_thread_id)
+                                if query_thread_id is not None
+                                else None
+                            ),
+                        )
+                        callback_event = MessageEvent(
+                            text="",
+                            source=event_source,
+                            message_id=callback_id,
+                        )
+                        response_scope = response_context(
+                            runner,
+                            callback_event,
+                            session_key,
+                        )
+                    with response_scope:
+                        count = resolve_gateway_approval(
+                            session_key,
+                            choice,
+                        )
                     logger.info(
                         "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                         count, session_key, choice, user_display,
