@@ -8,9 +8,12 @@ objects when ``dashboard.turn_isolation`` is enabled.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import concurrent.futures
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -22,6 +25,23 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent.interrupt_compat import request_hard_interrupt
+
+
+_IPC_MAC_KEY_ENV = "HERMES_COMPUTE_HOST_IPC_MAC_KEY"
+_IPC_MAC_KEY_BYTES = 32
+_URLSAFE_BASE64_RE = re.compile(r"^[A-Za-z0-9_-]+={0,2}$")
+
+
+def _pop_ipc_mac_key() -> bytes | None:
+    encoded = os.environ.pop(_IPC_MAC_KEY_ENV, None)
+    if not encoded or _URLSAFE_BASE64_RE.fullmatch(encoded) is None:
+        return None
+    padded = encoded + ("=" * (-len(encoded) % 4))
+    try:
+        decoded = base64.b64decode(padded, altchars=b"-_", validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    return decoded if len(decoded) == _IPC_MAC_KEY_BYTES else None
 
 
 def now_ns() -> int:
@@ -132,6 +152,7 @@ class ComputeHost:
         max_workers: int | None = None,
         heartbeat_secs: int | float | None = None,
     ) -> None:
+        self._ipc_mac_key = _pop_ipc_mac_key()
         self._stdout = stdout or sys.stdout
         self._write_lock = threading.Lock()
         self._sessions: dict[str, HostSession] = {}
@@ -398,7 +419,24 @@ class ComputeHost:
             except Exception:
                 pass
             text = frame.get("text") if "text" in frame else frame.get("prompt", "")
-            server._run_prompt_submit(request_id, sid, session, text)
+            from agent._trusted_interaction_issuer import (
+                _restore_trusted_interaction,
+            )
+
+            trusted_interaction = _restore_trusted_interaction(
+                frame.get("trusted_interaction"),
+                mac_key=self._ipc_mac_key,
+            )
+            if trusted_interaction is None:
+                server._run_prompt_submit(request_id, sid, session, text)
+            else:
+                server._run_prompt_submit(
+                    request_id,
+                    sid,
+                    session,
+                    text,
+                    trusted_interaction=trusted_interaction,
+                )
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):
                 run_thread.join()

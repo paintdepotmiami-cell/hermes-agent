@@ -699,6 +699,7 @@ export type GatewayEvent =
     }
   | {
       payload: {
+        approval_id?: string
         allow_permanent?: boolean
         choices?: string[]
         command: string

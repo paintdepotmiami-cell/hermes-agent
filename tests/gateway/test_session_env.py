@@ -34,6 +34,7 @@ def _reset_contextvars():
 def test_set_session_env_sets_contextvars(monkeypatch):
     """_set_session_env should populate contextvars, not os.environ."""
     runner = object.__new__(GatewayRunner)
+    runner._active_profile_name = lambda: "default"
     source = SessionSource(
         platform=Platform.TELEGRAM,
         chat_id="-1001",
@@ -43,7 +44,13 @@ def test_set_session_env_sets_contextvars(monkeypatch):
         user_name="alice",
         thread_id="17585",
     )
-    context = SessionContext(source=source, connected_platforms=[], home_channels={})
+    context = SessionContext(
+        source=source,
+        connected_platforms=[],
+        home_channels={},
+        session_key="agent:main:telegram:group:-1001:17585",
+        session_id="durable-session-1",
+    )
 
     monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
@@ -58,13 +65,16 @@ def test_set_session_env_sets_contextvars(monkeypatch):
 
     # Values should be readable via get_session_env (contextvar path)
     assert get_session_env("HERMES_SESSION_PLATFORM") == "telegram"
-    assert get_session_env("HERMES_SESSION_SOURCE") == ""
+    assert get_session_env("HERMES_SESSION_SOURCE") == "gateway"
     assert get_session_env("HERMES_SESSION_CHAT_ID") == "-1001"
     assert get_session_env("HERMES_SESSION_CHAT_NAME") == "Group"
     assert get_session_env("HERMES_SESSION_CHAT_TYPE") == "group"
     assert get_session_env("HERMES_SESSION_USER_ID") == "123456"
     assert get_session_env("HERMES_SESSION_USER_NAME") == "alice"
     assert get_session_env("HERMES_SESSION_THREAD_ID") == "17585"
+    assert get_session_env("HERMES_SESSION_KEY") == context.session_key
+    assert get_session_env("HERMES_SESSION_ID") == "durable-session-1"
+    assert get_session_env("HERMES_SESSION_PROFILE") == "default"
 
     # os.environ should NOT be touched
     assert os.getenv("HERMES_SESSION_PLATFORM") is None
