@@ -4811,7 +4811,28 @@ def _make_tool_handler(
 
             governor = get_mcp_governor(server_name)
         except Exception:
-            governor = None
+            logger.warning(
+                "MCP governance lookup failed for server %s; blocking tool call",
+                server_name,
+            )
+            return json.dumps(
+                {
+                    "dispatch_count": 0,
+                    "dispatch_started": False,
+                    "dispatch_tool": None,
+                    "invoked_tool": tool_name,
+                    "operation_hash": None,
+                    "outcome": {"summary": "MCP governance registry is unavailable"},
+                    "preflight_completed": False,
+                    "preflight_count": 0,
+                    "preflight_started": False,
+                    "server": server_name,
+                    "status": "blocked",
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
         if governor is not None:
             if (
                 governed_descriptor is None

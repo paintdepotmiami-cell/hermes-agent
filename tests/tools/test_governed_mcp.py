@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 from contextlib import contextmanager
 import dataclasses
 import hashlib
@@ -1407,6 +1408,65 @@ def register(ctx):
     assert "DRIFT_META_SENTINEL" not in json.dumps(swap)
     call_tool.assert_not_awaited()
     assert session is not server.session
+
+
+def test_governor_lookup_failure_blocks_without_sdk_call(monkeypatch, caplog):
+    call_tool = AsyncMock(
+        return_value=CallToolResult(
+            content=[TextContent(type="text", text="provider must not run")]
+        )
+    )
+    _server_with_tools(_tool(EXECUTE), call_tool=call_tool)
+    entry = registry.get_entry(mcp_tool.mcp_prefixed_tool_name(SERVER, EXECUTE))
+    assert entry is not None
+
+    def fail_lookup(_server_name: str):
+        raise RuntimeError("SENSITIVE_LOOKUP_DETAIL_DO_NOT_LOG")
+
+    monkeypatch.setattr(plugin_module, "get_mcp_governor", fail_lookup)
+
+    raw = entry.handler({"value": "sentinel"})
+    result = json.loads(raw)
+
+    assert result["status"] == "blocked"
+    assert result["preflight_started"] is False
+    assert result["preflight_count"] == 0
+    assert result["dispatch_started"] is False
+    assert result["dispatch_count"] == 0
+    assert "SENSITIVE_LOOKUP_DETAIL_DO_NOT_LOG" not in raw
+    assert "SENSITIVE_LOOKUP_DETAIL_DO_NOT_LOG" not in caplog.text
+    call_tool.assert_not_awaited()
+
+
+def test_governor_import_failure_blocks_without_sdk_call(monkeypatch, caplog):
+    call_tool = AsyncMock(
+        return_value=CallToolResult(
+            content=[TextContent(type="text", text="provider must not run")]
+        )
+    )
+    _server_with_tools(_tool(EXECUTE), call_tool=call_tool)
+    entry = registry.get_entry(mcp_tool.mcp_prefixed_tool_name(SERVER, EXECUTE))
+    assert entry is not None
+    real_import = builtins.__import__
+
+    def fail_plugin_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "hermes_cli.plugins" and "get_mcp_governor" in fromlist:
+            raise ImportError("SENSITIVE_IMPORT_DETAIL_DO_NOT_LOG")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fail_plugin_import)
+
+    raw = entry.handler({"value": "sentinel"})
+    result = json.loads(raw)
+
+    assert result["status"] == "blocked"
+    assert result["preflight_started"] is False
+    assert result["preflight_count"] == 0
+    assert result["dispatch_started"] is False
+    assert result["dispatch_count"] == 0
+    assert "SENSITIVE_IMPORT_DETAIL_DO_NOT_LOG" not in raw
+    assert "SENSITIVE_IMPORT_DETAIL_DO_NOT_LOG" not in caplog.text
+    call_tool.assert_not_awaited()
 
 
 @pytest.mark.parametrize("drift_kind", ["session", "descriptor"])
