@@ -1,6 +1,6 @@
 import type { ApprovalReq } from '../types.js'
 
-export function approvalRespondParams(req: ApprovalReq, choice: string, sessionId: string) {
+export function approvalRespondParams(req: ApprovalReq, choice: string, sessionId: string | null) {
   if (req.approvalId) {
     return {
       approval_id: req.approvalId,
