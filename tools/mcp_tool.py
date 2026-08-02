@@ -456,7 +456,9 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
     credentials to MCP server subprocesses.  Secret-source-injected vars are
     an exception: users configured that backend specifically so Hermes and
     its subprocesses can consume those credentials without duplicating them
-    in every MCP server's ``env:`` block.
+    in every MCP server's ``env:`` block. Names declared private by an enabled
+    plugin remain excluded even when secret-source tagged or explicitly set in
+    the MCP server's ``env:`` block.
     """
     try:
         from hermes_cli.env_loader import get_secret_source
@@ -473,7 +475,9 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
             env[key] = value
     if user_env:
         env.update(user_env)
-    return env
+    from private_secret_policy import scrub_private_secret_env
+
+    return scrub_private_secret_env(env)
 
 
 def _sanitize_error(text: str) -> str:
@@ -2432,6 +2436,12 @@ class MCPServerTask:
         # Applied AFTER the OSV preflight so the check inspects the real
         # package, not the watchdog wrapper.
         command, args = _wrap_command_with_watchdog(command, args)
+
+        # Command resolution may add PATH after _build_safe_env's scrub. Apply
+        # the current policy again at the actual SDK child boundary.
+        from private_secret_policy import scrub_private_secret_env
+
+        safe_env = scrub_private_secret_env(safe_env)
 
         server_params = StdioServerParameters(
             command=command,

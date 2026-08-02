@@ -316,13 +316,15 @@ class HostSupervisor:
         self._hello_event.clear()
         self._hello = {}
         env = hermes_subprocess_env(inherit_credentials=True)
-        env.update(os.environ)
         if self.env:
             env.update(self.env)
         env["HERMES_COMPUTE_HOST_HEARTBEAT_SECS"] = str(self.heartbeat_secs)
         env.setdefault("PYTHONPATH", str(_repo_root()))
         if str(_repo_root()) not in env["PYTHONPATH"].split(os.pathsep):
             env["PYTHONPATH"] = str(_repo_root()) + os.pathsep + env["PYTHONPATH"]
+        from private_secret_policy import scrub_private_secret_env
+
+        env = scrub_private_secret_env(env)
         proc = subprocess.Popen(
             self.argv,
             cwd=str(self.cwd),

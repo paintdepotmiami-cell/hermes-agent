@@ -48,6 +48,13 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Union
 
 from hermes_constants import get_hermes_home
+from private_secret_policy import (
+    PrivateSecretPolicyError,
+    prepare_private_secret_names,
+    replace_private_secret_names,
+    restore_private_secret_policy,
+    snapshot_private_secret_policy,
+)
 from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
@@ -399,6 +406,59 @@ class LoadedPlugin:
     # imported) loader. The module loads on first real use via the
     # platform_registry; see PluginManager._register_deferred_platform.
     deferred: bool = False
+
+
+def _manifest_private_secret_names(
+    manifest: PluginManifest,
+) -> frozenset[str]:
+    """Return validated private env names declared by one active manifest.
+
+    Bare-string ``requires_env`` entries and rich entries without
+    ``secret: true`` retain their existing setup semantics but do not become
+    host-private names.  A malformed attempt to declare a private name raises
+    a sanitized typed error without echoing manifest content.
+    """
+    raw_entries = manifest.requires_env
+    if raw_entries is None:
+        return frozenset()
+    if not isinstance(raw_entries, (list, tuple)):
+        if isinstance(raw_entries, dict) and "secret" in raw_entries:
+            raise PrivateSecretPolicyError(
+                "invalid plugin private-secret declaration"
+            )
+        return frozenset()
+
+    declared: list[object] = []
+    for entry in raw_entries:
+        if not isinstance(entry, dict):
+            continue
+        secret_marker = entry.get("secret", False)
+        if secret_marker is False or secret_marker is None:
+            continue
+        if secret_marker is not True:
+            raise PrivateSecretPolicyError(
+                "invalid plugin private-secret declaration"
+            )
+        declared.append(entry.get("name"))
+    return prepare_private_secret_names(declared)
+
+
+def _manifest_is_active_for_general_discovery(
+    manifest: PluginManifest,
+    disabled: set,
+    enabled: Optional[set],
+) -> bool:
+    """Match the general loader's activation rules without importing code."""
+    lookup_key = manifest.key or manifest.name
+    if lookup_key in disabled or manifest.name in disabled:
+        return False
+    if manifest.kind in {"exclusive", "model-provider"}:
+        return False
+    if manifest.source == "bundled" and manifest.kind in {"backend", "platform"}:
+        return True
+    return enabled is not None and (
+        lookup_key in enabled or manifest.name in enabled
+    )
 
 
 class _PluginManagerState:
@@ -2264,6 +2324,10 @@ class PluginManager:
             try:
                 self._discover_and_load_inner()
             except BaseException:
+                # Initial discovery publishes the complete active-winner deny
+                # set before importing any plugin. Keep that safe overblock if
+                # a later plugin raises BaseException; partial registrations
+                # remain committed and the next call retries the sweep.
                 with self._lock:
                     self._discovered = False
                     self._generation += 1
@@ -2279,6 +2343,11 @@ class PluginManager:
                     self._generation += 1
                 return
 
+            # Private names are a deny-only security policy. Publish the
+            # complete candidate set inside _discover_and_load_inner() before
+            # arbitrary plugin code runs, then restore this exact checkpoint
+            # if the candidate generation cannot commit.
+            private_policy_snapshot = snapshot_private_secret_policy()
             transaction = _RegistrationTransaction(
                 self,
                 replace_owned=True,
@@ -2288,6 +2357,7 @@ class PluginManager:
                 self._discover_and_load_inner(transaction)
                 transaction.commit()
             except (_ForceSweepAbort, RegistryTransactionConflict) as exc:
+                restore_private_secret_policy(private_policy_snapshot)
                 _restore_module_namespace(_NS_PARENT, module_snapshot)
                 if isinstance(exc, RegistryTransactionConflict):
                     logger.warning(
@@ -2300,6 +2370,7 @@ class PluginManager:
                     )
                 return
             except BaseException:
+                restore_private_secret_policy(private_policy_snapshot)
                 _restore_module_namespace(_NS_PARENT, module_snapshot)
                 raise
 
@@ -2376,6 +2447,22 @@ class PluginManager:
         for manifest in manifests:
             winners[manifest.key or manifest.name] = manifest
 
+        # Build the complete replacement while the old immutable deny set
+        # remains live. Publish once, before any winning plugin module is
+        # imported or any deferred arbitrary-code loader is registered.
+        private_names: set[str] = set()
+        invalid_private_declarations: set[str] = set()
+        for lookup_key, manifest in winners.items():
+            if not _manifest_is_active_for_general_discovery(
+                manifest, disabled, enabled
+            ):
+                continue
+            try:
+                private_names.update(_manifest_private_secret_names(manifest))
+            except PrivateSecretPolicyError:
+                invalid_private_declarations.add(lookup_key)
+        replace_private_secret_names(private_names)
+
         for manifest in winners.values():
             lookup_key = manifest.key or manifest.name
 
@@ -2388,6 +2475,26 @@ class PluginManager:
                     target._plugins[lookup_key] = loaded
                     target._generation += 1
                 logger.debug("Skipping disabled plugin '%s'", lookup_key)
+                continue
+
+            # A malformed private declaration disables an otherwise active
+            # plugin before import. Manifest metadata is attacker-controlled,
+            # so neither the declaration nor the underlying exception is
+            # reflected into logs.
+            if lookup_key in invalid_private_declarations:
+                loaded = LoadedPlugin(manifest=manifest, enabled=False)
+                loaded.error = (
+                    "PrivateSecretPolicyError: plugin private-secret "
+                    "declaration invalid"
+                )
+                with target._lock:
+                    target._plugins[lookup_key] = loaded
+                    target._generation += 1
+                logger.warning(
+                    "Failed to load plugin '%s': invalid private-secret "
+                    "environment declaration",
+                    manifest.name,
+                )
                 continue
 
             # Exclusive plugins (memory providers) have their own

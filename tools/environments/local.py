@@ -453,6 +453,13 @@ def _inject_session_context_env(env: dict) -> None:
             env.pop(var_name, None)
 
 
+def _final_scrub_private_secret_env(env: dict[str, str]) -> dict[str, str]:
+    """Apply the host-owned plugin private-name policy at a final boundary."""
+    from private_secret_policy import scrub_private_secret_env
+
+    return scrub_private_secret_env(env)
+
+
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:
@@ -510,7 +517,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
 
     sanitized = _scrub_delegated_child_kanban_env(sanitized)
 
-    return sanitized
+    return _final_scrub_private_secret_env(sanitized)
 
 
 def _scrub_delegated_child_kanban_env(env: dict[str, str]) -> dict[str, str]:
@@ -653,7 +660,7 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # still see the parent's HERMES_HOME but lose the DB mutation guard.
     env = _scrub_delegated_child_kanban_env(env)
 
-    return env
+    return _final_scrub_private_secret_env(env)
 
 
 def build_subprocess_env(
@@ -686,19 +693,22 @@ def build_subprocess_env(
       home propagation is inherent — ``inherit_profile_home`` is ignored
       (always applied), exactly matching today's sanitize semantics.
     * ``scrub_secrets=False`` — preserve the base env content byte-for-byte
-      (no key is removed).  Use for children that intentionally receive
-      secrets (git credential flows, ``bws``/``op`` secret CLIs) or where
-      scrubbing could change behavior.  The site is still a win: it becomes
-      grep-able and future-fixable.
+      except for names declared private by an enabled plugin, which are always
+      removed at the final boundary. Use for children that intentionally
+      receive other secrets (git credential flows, ``bws``/``op`` secret CLIs)
+      or where general credential scrubbing could change behavior. The site is
+      still a win: it becomes grep-able and future-fixable.
     * ``inherit_profile_home`` — on the non-scrub path, when True, bridge the
       context-local Hermes home override into ``HERMES_HOME`` and apply the
       subprocess HOME contract (``hermes_constants.apply_subprocess_home_env``).
-      Pass False to keep the inherited env untouched (exact legacy
-      ``os.environ.copy()`` behavior).
-    * ``extra`` — applied **last** on the non-scrub path so explicit caller
-      overrides (e.g. a session-scoped ``HERMES_HOME``) always win.  On the
-      scrub path it is forwarded as ``_sanitize_subprocess_env``'s
-      ``extra_env`` (same force-prefix / blocklist handling as today).
+      Pass False to retain the legacy HOME behavior; plugin-private names are
+      still removed.
+    * ``extra`` — applied last on the non-scrub path; explicit caller
+      overrides (e.g. a session-scoped ``HERMES_HOME``) win unless the name is
+      plugin-private. On the scrub path it is forwarded as
+      ``_sanitize_subprocess_env``'s ``extra_env`` (same force-prefix /
+      blocklist handling as today), followed by the same final private-name
+      scrub.
     """
     if scrub_secrets:
         # _sanitize_subprocess_env already performs HERMES_HOME override
@@ -716,7 +726,7 @@ def build_subprocess_env(
         apply_subprocess_home_env(env)
     if extra:
         env.update(extra)
-    return env
+    return _final_scrub_private_secret_env(env)
 
 
 def _find_bash() -> str:
@@ -1325,7 +1335,7 @@ def _make_run_env(env: dict) -> dict:
 
     run_env = _scrub_delegated_child_kanban_env(run_env)
 
-    return run_env
+    return _final_scrub_private_secret_env(run_env)
 
 
 def _read_terminal_shell_init_config() -> tuple[list[str], bool]:

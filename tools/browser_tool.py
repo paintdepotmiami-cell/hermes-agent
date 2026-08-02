@@ -137,7 +137,9 @@ def _build_browser_env() -> dict:
     for _key in _BROWSER_PASSTHROUGH_KEYS:
         if _key in os.environ:
             env[_key] = os.environ[_key]
-    return env
+    from private_secret_policy import scrub_private_secret_env
+
+    return scrub_private_secret_env(env)
 
 try:
     from tools.website_policy import check_website_access
