@@ -2559,6 +2559,73 @@ def test_preflight_failure_after_sdk_call_begins_is_unknown_and_never_retried(
     assert len(calls) == 1
 
 
+def test_governed_preflight_marks_activity_before_sdk_call_and_avoids_idle_recycle(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "preflight-activity"
+    name = "neutral_governor_preflight_activity"
+    body = f'''        services.preflight_call(
+            {PREFLIGHT!r}, {{"probe": "sentinel"}}
+        )
+        raise RuntimeError("stop after preflight")'''
+    _write_plugin(home, name, _prepare_case_source(body))
+    _discover_plugin(home, monkeypatch, name)
+    sdk_entered = threading.Event()
+    release_sdk = threading.Event()
+    observed = {}
+
+    async def call_tool(raw_name, arguments, *, meta=None):
+        del raw_name, arguments, meta
+        observed["activity_at_sdk_entry"] = server._last_tool_call_at
+        sdk_entered.set()
+        assert await asyncio.to_thread(release_sdk.wait, 5)
+        return CallToolResult(
+            content=[TextContent(type="text", text="preflight complete")],
+            structuredContent={"proposal": "sentinel"},
+        )
+
+    server, session, registered = _server_with_tools(
+        _tool(EXECUTE),
+        _tool(PREFLIGHT),
+        call_tool=call_tool,
+    )
+    server._config = {"command": "neutral-stdio-server"}
+    server._idle_timeout_seconds = 1.0
+    lifecycle_decision_at = time.monotonic()
+    stale_activity_at = lifecycle_decision_at - 10.0
+    server._last_tool_call_at = stale_activity_at
+
+    def invoke():
+        with _trusted_scope(platform="telegram"):
+            observed["raw"] = registry.dispatch(
+                registered[0],
+                {"value": "sentinel"},
+            )
+
+    worker = threading.Thread(target=invoke, daemon=True)
+    worker.start()
+    try:
+        assert sdk_entered.wait(timeout=5), "preflight SDK call did not start"
+        assert observed["activity_at_sdk_entry"] > stale_activity_at
+    finally:
+        release_sdk.set()
+        worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    recycle_reason = server._stdio_recycle_reason(now=lifecycle_decision_at)
+    if recycle_reason is not None:
+        server._mark_stdio_recycled(recycle_reason)
+
+    result = json.loads(observed["raw"])
+    assert result["status"] == "blocked"
+    assert result["preflight_started"] is True
+    assert result["preflight_completed"] is True
+    assert result["preflight_count"] == 1
+    assert result["dispatch_count"] == 0
+    assert recycle_reason is None
+    assert server.session is session
+
+
 def test_governed_preflight_sets_pending_call_context_and_restores_prior_value(
     tmp_path, monkeypatch
 ):

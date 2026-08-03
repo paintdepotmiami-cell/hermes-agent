@@ -755,6 +755,9 @@ class _GovernedServices:
                     raise _GovernanceViolation(
                         "preflight target changed before SDK call"
                     )
+                mark_tool_call = getattr(self._server, "mark_tool_call", None)
+                if callable(mark_tool_call):
+                    mark_tool_call()
                 with self._lock:
                     self.preflight_started = True
                     self.preflight_count = 1
