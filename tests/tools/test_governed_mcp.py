@@ -3075,6 +3075,106 @@ def register(ctx):
     assert EXECUTE_META_SENTINEL not in json.dumps(notifications)
 
 
+def test_transport_meta_primitives_do_not_corrupt_governed_audit_field_types(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "audit-type-preservation"
+    name = "neutral_governor_audit_type_preservation"
+    nested_secret = "NESTED_TRANSPORT_META_SENTINEL"
+    source = f'''from tools.governed_mcp import GovernedDispatchPlan, GovernedOutcome
+
+class Policy:
+    def prepare(self, request, services):
+        operation = services.bind_operation(
+            {EXECUTE!r},
+            request.arguments,
+            proposal_hash="neutral-proposal-hash",
+            preview="neutral preview {EXECUTE_META_SENTINEL}",
+            display_text="neutral display {nested_secret}",
+            base_meta={{
+                {META_FIELD!r}: {EXECUTE_META_SENTINEL!r},
+                "truthy": True,
+                "falsey": False,
+                "zero": 0,
+                "one": 1,
+                "nested": {{
+                    "secret": {nested_secret!r},
+                    "truthy": True,
+                    "falsey": False,
+                    "zero": 0,
+                    "one": 1,
+                }},
+            }},
+        )
+        receipt = services.request_fresh_approval(operation)
+        return GovernedDispatchPlan(operation, receipt, {{}}, {{}})
+
+    def finalize(self, request, operation, result):
+        del request, operation
+        reflected = dict(result.meta)
+        return GovernedOutcome(
+            "verified",
+            f"summary {{reflected[{META_FIELD!r}]}}",
+            {{"reflected": reflected}},
+        )
+
+def register(ctx):
+    ctx.register_mcp_governor({SERVER!r}, Policy())
+'''
+    _write_plugin(home, name, source)
+    _discover_plugin(home, monkeypatch, name)
+    notifications = []
+
+    async def call_tool(raw_name, arguments, *, meta=None):
+        del raw_name, arguments
+        return CallToolResult(
+            content=[TextContent(type="text", text="dispatch complete")],
+            _meta=dict(meta or {}),
+        )
+
+    _server_with_tools(_tool(EXECUTE), call_tool=call_tool)
+    clock = [7200.0]
+    coordinator = fresh_approval.FreshApprovalCoordinator(clock=lambda: clock[0])
+    monkeypatch.setattr(fresh_approval, "_DEFAULT_COORDINATOR", coordinator)
+    register_gateway_notify(
+        "neutral-telegram-session",
+        _auto_approve_notifier(coordinator, clock, notifications),
+    )
+
+    with _trusted_scope(platform="telegram"):
+        raw = registry.dispatch(
+            mcp_tool.mcp_prefixed_tool_name(SERVER, EXECUTE),
+            {"value": "sentinel"},
+        )
+    result = json.loads(raw)
+    evidence = result["outcome"]["evidence"]["reflected"]
+
+    assert result["status"] == "verified"
+    assert result["dispatch_started"] is True
+    assert type(result["dispatch_started"]) is bool
+    assert result["preflight_started"] is False
+    assert type(result["preflight_started"]) is bool
+    assert result["dispatch_count"] == 1
+    assert type(result["dispatch_count"]) is int
+    assert result["preflight_count"] == 0
+    assert type(result["preflight_count"]) is int
+    assert EXECUTE_META_SENTINEL not in raw
+    assert nested_secret not in raw
+    assert EXECUTE_META_SENTINEL not in notifications[0]["command"]
+    assert nested_secret not in notifications[0]["description"]
+    assert result["outcome"]["summary"] == "summary [REDACTED]"
+    assert evidence[META_FIELD] == "[REDACTED]"
+    assert evidence["truthy"] == "[REDACTED]"
+    assert evidence["falsey"] == "[REDACTED]"
+    assert evidence["zero"] == "[REDACTED]"
+    assert evidence["one"] == "[REDACTED]"
+    assert nested_secret not in evidence["nested"]["secret"]
+    assert evidence["nested"]["truthy"] == "[REDACTED]"
+    assert evidence["nested"]["falsey"] == "[REDACTED]"
+    assert evidence["nested"]["zero"] == "[REDACTED]"
+    assert evidence["nested"]["one"] == "[REDACTED]"
+
+
 def _governor_source_for(server_name: str) -> str:
     return f'''class Policy:
     def prepare(self, request, services):

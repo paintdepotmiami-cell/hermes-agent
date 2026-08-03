@@ -443,19 +443,35 @@ def _transport_meta_atoms(value: object) -> tuple[object, ...]:
     return tuple(atoms)
 
 
-def _sanitize_host_meta_values(
+def _host_meta_string_atoms(atoms: Sequence[object]) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                atom
+                for atom in atoms
+                if isinstance(atom, str) and atom
+            },
+            key=len,
+            reverse=True,
+        )
+    )
+
+
+def _redact_host_meta_text(
+    value: str,
+    atoms: Sequence[object],
+) -> str:
+    item = value
+    for atom in _host_meta_string_atoms(atoms):
+        item = item.replace(atom, "[REDACTED]")
+    return item
+
+
+def _sanitize_host_meta_evidence(
     value: Any,
     atoms: Sequence[object],
 ) -> Any:
-    string_atoms = sorted(
-        {
-            atom
-            for atom in atoms
-            if isinstance(atom, str) and atom
-        },
-        key=len,
-        reverse=True,
-    )
+    string_atoms = _host_meta_string_atoms(atoms)
 
     def _sanitize(item: Any) -> Any:
         if isinstance(item, str):
@@ -464,7 +480,7 @@ def _sanitize_host_meta_values(
             return item
         if isinstance(item, Mapping):
             return {
-                _sanitize(key): _sanitize(nested)
+                key: _sanitize(nested)
                 for key, nested in item.items()
             }
         if isinstance(item, (list, tuple)):
@@ -798,7 +814,7 @@ class _GovernedServices:
         )
         self._remember_transport_meta(frozen_base_meta)
         proposal = _validate_hash("proposal hash", proposal_hash)
-        safe_preview = _sanitize_host_meta_values(
+        safe_preview = _redact_host_meta_text(
             _redact_text(
                 _validate_text(
                     "preview",
@@ -808,7 +824,7 @@ class _GovernedServices:
             ),
             self.host_meta_atoms,
         )
-        safe_display = _sanitize_host_meta_values(
+        safe_display = _redact_host_meta_text(
             _redact_text(
                 _validate_text(
                     "display text",
@@ -1009,13 +1025,19 @@ def _audit_json(
     preflight_completed = bool(services and services.preflight_completed)
     dispatch_started = bool(services and services.dispatch_started)
     dispatch_tool_name = services.dispatch_tool_name if services else None
+    host_meta_atoms = services.host_meta_atoms if services else ()
     payload: dict[str, Any] = {
         "dispatch_count": services.dispatch_count if services else 0,
         "dispatch_started": dispatch_started,
         "dispatch_tool": dispatch_tool_name,
         "invoked_tool": descriptor.raw_tool_name,
         "operation_hash": operation_hash,
-        "outcome": {"summary": _redact_text(summary)[:_MAX_TEXT_CHARS]},
+        "outcome": {
+            "summary": _redact_host_meta_text(
+                _redact_text(summary)[:_MAX_TEXT_CHARS],
+                host_meta_atoms,
+            )
+        },
         "preflight_completed": preflight_completed,
         "preflight_count": services.preflight_count if services else 0,
         "preflight_started": preflight_started,
@@ -1023,11 +1045,9 @@ def _audit_json(
         "status": status,
     }
     if evidence is not None:
-        payload["outcome"]["evidence"] = _deep_thaw(evidence)
-    if services is not None:
-        payload = _sanitize_host_meta_values(
-            payload,
-            services.host_meta_atoms,
+        payload["outcome"]["evidence"] = _sanitize_host_meta_evidence(
+            _deep_thaw(evidence),
+            host_meta_atoms,
         )
     return json.dumps(
         payload,
