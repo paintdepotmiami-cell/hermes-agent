@@ -4803,6 +4803,8 @@ def _make_tool_handler(
 
     def _handler(args: dict, **kwargs) -> str:
         governed_read_only_retry = None
+        governed_read_only_session = None
+        governed_read_only_blocked = None
         # Exact-server governors are selected at invocation so a transactional
         # plugin load/force-reload never requires rebuilding the model tool
         # schema. Their handler snapshot, however, is discovery-owned: session
@@ -4867,6 +4869,9 @@ def _make_tool_handler(
                 )
             from tools.governed_mcp_dispatch import (
                 _READ_ONLY_PASS_THROUGH,
+                _GovernanceViolation,
+                _audit_json,
+                _target_is_current,
                 dispatch_governed_mcp,
             )
 
@@ -4880,6 +4885,13 @@ def _make_tool_handler(
             )
             if governed_result is not _READ_ONLY_PASS_THROUGH:
                 return governed_result
+            governed_read_only_session = current_governed_session
+            governed_read_only_blocked = lambda: _audit_json(
+                descriptor=governed_descriptor,
+                status="blocked",
+                services=None,
+                summary="read-only pass-through validation failed",
+            )
 
             def _retry_read_only_governed_call() -> str:
                 retry_session = getattr(governed_server, "session", None)
@@ -4893,7 +4905,7 @@ def _make_tool_handler(
                 )
                 if retry_result is not _READ_ONLY_PASS_THROUGH:
                     return retry_result
-                return _call_once()
+                return _call_once(read_only_session=retry_session)
 
             governed_read_only_retry = _retry_read_only_governed_call
 
@@ -4956,16 +4968,30 @@ def _make_tool_handler(
                     )
                 return tool_error(f"MCP server '{server_name}' is not connected")
 
-        async def _call():
+        async def _call(*, read_only_session=None):
             _mark_server_call_started(server)
             async with server._rpc_lock:
+                call_session = server.session
+                if read_only_session is not None:
+                    if (
+                        server is not governed_server
+                        or not _target_is_current(
+                            governed_server,
+                            read_only_session,
+                            governed_descriptor,
+                        )
+                    ):
+                        raise _GovernanceViolation(
+                            "read-only target changed before SDK call"
+                        )
+                    call_session = read_only_session
                 # Snapshot the agent's context so an elicitation callback
                 # triggered during this call (fired on the MCP recv loop
                 # task, which doesn't inherit our contextvars) can replay
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    result = await call_session.call_tool(tool_name, arguments=args)
                 finally:
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably
@@ -5054,13 +5080,21 @@ def _make_tool_handler(
                 return json.dumps({"result": structured}, ensure_ascii=False)
             return json.dumps({"result": text_result}, ensure_ascii=False)
 
-        def _call_once():
-            return _run_on_mcp_loop(_call, timeout=tool_timeout)
+        def _call_once(*, read_only_session=None):
+            try:
+                return _run_on_mcp_loop(
+                    lambda: _call(read_only_session=read_only_session),
+                    timeout=tool_timeout,
+                )
+            except _GovernanceViolation:
+                if governed_read_only_blocked is not None:
+                    return governed_read_only_blocked()
+                raise
 
         retry_call = governed_read_only_retry or _call_once
 
         try:
-            result = _call_once()
+            result = _call_once(read_only_session=governed_read_only_session)
             # Check if the MCP tool itself returned an error
             try:
                 parsed = json.loads(result)

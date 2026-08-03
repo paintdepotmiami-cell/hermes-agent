@@ -915,6 +915,115 @@ def test_real_sdk_read_only_hint_true_uses_closed_legacy_handler_exactly_once(
     assert calls == [(READ, {"value": "read-sentinel"})]
 
 
+def test_governed_read_only_refresh_drift_blocks_before_sdk_call(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "read-only-refresh-drift"
+    name = "neutral_governor_read_only_refresh_drift"
+    _write_plugin(home, name, _read_only_policy_source())
+    _discover_plugin(home, monkeypatch, name)
+    original_call = AsyncMock()
+    server, original_session, registered = _server_with_tools(
+        _tool(READ, annotations=ToolAnnotations(readOnlyHint=True)),
+        call_tool=original_call,
+    )
+    gate_entered = threading.Event()
+    release_gate = threading.Event()
+    original_run_on_mcp_loop = mcp_tool._run_on_mcp_loop
+
+    def gate_run_on_mcp_loop(coro_or_factory, timeout=30):
+        if not gate_entered.is_set():
+            gate_entered.set()
+            assert release_gate.wait(timeout=5), "legacy call did not pause"
+        return original_run_on_mcp_loop(coro_or_factory, timeout=timeout)
+
+    monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", gate_run_on_mcp_loop)
+    replacement_call = AsyncMock()
+    drifted_tool = _tool(
+        READ,
+        annotations=ToolAnnotations(readOnlyHint=True),
+        meta={"drift": "refresh"},
+    )
+    replacement_session = SimpleNamespace(
+        call_tool=replacement_call,
+        list_tools=AsyncMock(return_value=[drifted_tool]),
+    )
+    observed = {}
+
+    def invoke():
+        with _trusted_scope(platform="local"):
+            observed["raw"] = registry.dispatch(
+                registered[0],
+                {"value": "read-sentinel"},
+            )
+
+    worker = threading.Thread(target=invoke, daemon=True)
+    worker.start()
+    assert gate_entered.wait(timeout=5), "governed legacy handoff did not pause"
+    server.session = replacement_session
+    original_run_on_mcp_loop(server._refresh_tools, timeout=30)
+    release_gate.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    result = json.loads(observed["raw"])
+    assert result["status"] == "blocked"
+    assert result["dispatch_started"] is False
+    assert result["dispatch_count"] == 0
+    original_call.assert_not_awaited()
+    replacement_call.assert_not_awaited()
+    assert original_session is not server.session
+
+
+def test_governed_read_only_unchanged_target_calls_sdk_once_after_pause(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "read-only-unchanged"
+    name = "neutral_governor_read_only_unchanged"
+    _write_plugin(home, name, _read_only_policy_source())
+    _discover_plugin(home, monkeypatch, name)
+    call_tool = AsyncMock(
+        return_value=CallToolResult(
+            content=[TextContent(type="text", text="read-safe-result")]
+        )
+    )
+    _server, _session, registered = _server_with_tools(
+        _tool(READ, annotations=ToolAnnotations(readOnlyHint=True)),
+        call_tool=call_tool,
+    )
+    gate_entered = threading.Event()
+    release_gate = threading.Event()
+    original_run_on_mcp_loop = mcp_tool._run_on_mcp_loop
+
+    def gate_run_on_mcp_loop(coro_or_factory, timeout=30):
+        if not gate_entered.is_set():
+            gate_entered.set()
+            assert release_gate.wait(timeout=5), "legacy call did not pause"
+        return original_run_on_mcp_loop(coro_or_factory, timeout=timeout)
+
+    monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", gate_run_on_mcp_loop)
+    observed = {}
+
+    def invoke():
+        with _trusted_scope(platform="local"):
+            observed["raw"] = registry.dispatch(
+                registered[0],
+                {"value": "read-sentinel"},
+            )
+
+    worker = threading.Thread(target=invoke, daemon=True)
+    worker.start()
+    assert gate_entered.wait(timeout=5), "governed legacy handoff did not pause"
+    release_gate.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert json.loads(observed["raw"]) == {"result": "read-safe-result"}
+    call_tool.assert_awaited_once_with(
+        READ, arguments={"value": "read-sentinel"}
+    )
+
+
 def _install_governed_retry_reconnect(
     monkeypatch,
     server,
