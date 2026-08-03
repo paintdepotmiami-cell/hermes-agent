@@ -956,6 +956,90 @@ def test_read_only_pass_through_preserves_legacy_retry_path(
     ]
 
 
+@pytest.mark.parametrize("reconnect_origin", ["manual", "auth", "stdio"])
+def test_governed_read_only_rebinds_clean_reconnect_without_list_changed(
+    tmp_path, monkeypatch, reconnect_origin
+):
+    home = tmp_path / f"home-{reconnect_origin}"
+    name = f"neutral_governor_reconnect_{reconnect_origin}"
+    _write_plugin(home, name, _read_only_policy_source())
+    _discover_plugin(home, monkeypatch, name)
+
+    original_call = AsyncMock()
+    server, original_session, registered = _server_with_tools(
+        _tool(READ, annotations=ToolAnnotations(readOnlyHint=True)),
+        call_tool=original_call,
+    )
+    replacement_call = AsyncMock(
+        return_value=CallToolResult(
+            content=[TextContent(type="text", text=f"{reconnect_origin}-reconnected")]
+        )
+    )
+    server.session = SimpleNamespace(call_tool=replacement_call)
+
+    server._register_discovered_tools_if_needed()
+
+    with _trusted_scope(platform="local"):
+        raw = registry.dispatch(
+            registered[0],
+            {"value": "read-sentinel"},
+        )
+
+    assert json.loads(raw) == {"result": f"{reconnect_origin}-reconnected"}
+    original_call.assert_not_awaited()
+    replacement_call.assert_awaited_once_with(
+        READ, arguments={"value": "read-sentinel"}
+    )
+
+
+@pytest.mark.parametrize("descriptor_drift", ["description", "duplicate"])
+def test_governed_reconnect_descriptor_drift_blocks_without_sdk_call(
+    tmp_path, monkeypatch, descriptor_drift
+):
+    home = tmp_path / f"home-{descriptor_drift}"
+    name = f"neutral_governor_reconnect_drift_{descriptor_drift}"
+    _write_plugin(home, name, _read_only_policy_source())
+    _discover_plugin(home, monkeypatch, name)
+
+    original_call = AsyncMock()
+    server, original_session, registered = _server_with_tools(
+        _tool(READ, annotations=ToolAnnotations(readOnlyHint=True)),
+        call_tool=original_call,
+    )
+    replacement_call = AsyncMock()
+    server.session = SimpleNamespace(call_tool=replacement_call)
+    if descriptor_drift == "description":
+        server._tools = [
+            _tool(
+                READ,
+                annotations=ToolAnnotations(readOnlyHint=True),
+                meta={"drift": "changed"},
+            )
+        ]
+    else:
+        server._tools = [
+            _tool(READ, annotations=ToolAnnotations(readOnlyHint=True)),
+            _tool(READ, annotations=ToolAnnotations(readOnlyHint=True)),
+        ]
+
+    server._register_discovered_tools_if_needed()
+
+    with _trusted_scope(platform="local"):
+        result = json.loads(
+            registry.dispatch(
+                registered[0],
+                {"value": "read-sentinel"},
+            )
+        )
+
+    assert result["status"] == "blocked"
+    assert result["dispatch_count"] == 0
+    assert result["dispatch_started"] is False
+    original_call.assert_not_awaited()
+    replacement_call.assert_not_awaited()
+    assert original_session is not server.session
+
+
 @pytest.mark.parametrize(
     "annotation_value",
     [pytest.param(None, id="missing"), False, "true", 1],

@@ -4834,10 +4834,15 @@ def _make_tool_handler(
                 sort_keys=True,
             )
         if governor is not None:
+            current_governed_session = (
+                getattr(governed_server, "session", None)
+                if governed_server is not None
+                else None
+            )
             if (
                 governed_descriptor is None
                 or governed_server is None
-                or governed_session is None
+                or current_governed_session is None
             ):
                 return json.dumps(
                     {
@@ -4868,7 +4873,7 @@ def _make_tool_handler(
                 registration=governor,
                 descriptor=governed_descriptor,
                 server=governed_server,
-                session=governed_session,
+                session=current_governed_session,
                 arguments=args,
                 tool_timeout=tool_timeout,
             )
