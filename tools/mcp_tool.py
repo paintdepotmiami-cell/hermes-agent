@@ -3651,6 +3651,43 @@ def _reset_server_error(server_name: str) -> None:
     _server_breaker_opened_at.pop(server_name, None)
 
 
+def _classify_mcp_call_result(result: object) -> str:
+    action = getattr(result, "breaker_action", None)
+    if action in {"bump", "reset", "ignore"}:
+        return action
+    try:
+        parsed = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return "reset"
+    return "bump" if "error" in parsed else "reset"
+
+
+def _apply_mcp_result_accounting(server_name: str, result: object) -> str:
+    action = _classify_mcp_call_result(result)
+    if action == "bump":
+        _bump_server_error(server_name)
+    elif action == "reset":
+        _reset_server_error(server_name)
+    return result
+
+
+def _breaker_short_circuit_result(server_name: str) -> str | None:
+    if _server_error_counts.get(server_name, 0) < _CIRCUIT_BREAKER_THRESHOLD:
+        return None
+    opened_at = _server_breaker_opened_at.get(server_name, 0.0)
+    age = time.monotonic() - opened_at
+    if age >= _CIRCUIT_BREAKER_COOLDOWN_SEC:
+        return None
+    remaining = max(1, int(_CIRCUIT_BREAKER_COOLDOWN_SEC - age))
+    return tool_error(
+        f"MCP server '{server_name}' is unreachable after "
+        f"{_server_error_counts[server_name]} consecutive "
+        f"failures. Auto-retry available in ~{remaining}s. "
+        f"Do NOT retry this tool yet — use alternative "
+        f"approaches or ask the user to check the MCP server."
+    )
+
+
 def _signal_reconnect(server: Any) -> bool:
     """Ask a server task to rebuild its transport, thread-safely.
 
@@ -3916,6 +3953,8 @@ def _handle_auth_error_and_retry(
 
         try:
             result = retry_call()
+            if getattr(result, "breaker_action", None) in {"bump", "reset", "ignore"}:
+                return _apply_mcp_result_accounting(server_name, result)
             try:
                 parsed = json.loads(result)
                 if "error" not in parsed:
@@ -4110,6 +4149,8 @@ def _handle_session_expired_and_retry(
 
     try:
         result = retry_call()
+        if getattr(result, "breaker_action", None) in {"bump", "reset", "ignore"}:
+            return _apply_mcp_result_accounting(server_name, result)
         try:
             parsed = json.loads(result)
             if "error" not in parsed:
@@ -4805,6 +4846,45 @@ def _make_tool_handler(
         governed_read_only_retry = None
         governed_read_only_session = None
         governed_read_only_blocked = None
+        breaker_result = _breaker_short_circuit_result(server_name)
+        if breaker_result is not None:
+            return breaker_result
+
+        server = _get_connected_server_for_call(server_name)
+        if not server:
+            _bump_server_error(server_name)
+            return tool_error(f"MCP server '{server_name}' is not connected")
+
+        if not server.session:
+            # No live session. A reconnect may already be completing (the
+            # transport swaps in a fresh session object asynchronously) —
+            # wait briefly before treating this as a failure, so a
+            # transient reconnect window doesn't burn a circuit-breaker
+            # strike (#26892).
+            if _wait_for_server_session_ready(
+                server, timeout=min(5.0, float(tool_timeout or 5.0)),
+            ):
+                pass  # Fresh session arrived; proceed below.
+            else:
+                # Still down — the server task is reconnecting, or it has
+                # exhausted its retry budget and parked (e.g. a dead stdio
+                # subprocess). Probing here would write into a dead/absent
+                # transport and re-arm the breaker forever (#16788). Instead,
+                # ask the (always-present) server task to rebuild the
+                # transport — which respawns a dead stdio subprocess — and
+                # return a clean "reconnecting" error so the model backs off
+                # without burning iterations. The breaker resets once the
+                # fresh session initializes (_run_stdio/_run_http call
+                # _reset_server_error).
+                _bump_server_error(server_name)
+                if _signal_reconnect(server):
+                    return tool_error(
+                        f"MCP server '{server_name}' transport is down; "
+                        f"reconnect requested. Do NOT retry this tool "
+                        f"immediately — give it a few seconds to come back."
+                    )
+                return tool_error(f"MCP server '{server_name}' is not connected")
+
         # Exact-server governors are selected at invocation so a transactional
         # plugin load/force-reload never requires rebuilding the model tool
         # schema. Their handler snapshot, however, is discovery-owned: session
@@ -4884,7 +4964,7 @@ def _make_tool_handler(
                 tool_timeout=tool_timeout,
             )
             if governed_result is not _READ_ONLY_PASS_THROUGH:
-                return governed_result
+                return _apply_mcp_result_accounting(server_name, governed_result)
             governed_read_only_session = current_governed_session
             governed_read_only_blocked = lambda: _audit_json(
                 descriptor=governed_descriptor,
@@ -4908,65 +4988,6 @@ def _make_tool_handler(
                 return _call_once(read_only_session=retry_session)
 
             governed_read_only_retry = _retry_read_only_governed_call
-
-        # Circuit breaker: if this server has failed too many times
-        # consecutively, short-circuit with a clear message so the model
-        # stops retrying and uses alternative approaches (#10447).
-        #
-        # Once the cooldown elapses, the breaker transitions to
-        # half-open: we let the *next* call through as a probe. On
-        # success the success-path below resets the breaker; on
-        # failure the error paths below bump the count again, which
-        # re-stamps the open-time via _bump_server_error (re-arming
-        # the cooldown).
-        if _server_error_counts.get(server_name, 0) >= _CIRCUIT_BREAKER_THRESHOLD:
-            opened_at = _server_breaker_opened_at.get(server_name, 0.0)
-            age = time.monotonic() - opened_at
-            if age < _CIRCUIT_BREAKER_COOLDOWN_SEC:
-                remaining = max(1, int(_CIRCUIT_BREAKER_COOLDOWN_SEC - age))
-                return tool_error(
-                    f"MCP server '{server_name}' is unreachable after "
-                    f"{_server_error_counts[server_name]} consecutive "
-                    f"failures. Auto-retry available in ~{remaining}s. "
-                    f"Do NOT retry this tool yet — use alternative "
-                    f"approaches or ask the user to check the MCP server."
-                )
-            # Cooldown elapsed → fall through as a half-open probe.
-
-        server = _get_connected_server_for_call(server_name)
-        if not server:
-            _bump_server_error(server_name)
-            return tool_error(f"MCP server '{server_name}' is not connected")
-
-        if not server.session:
-            # No live session. A reconnect may already be completing (the
-            # transport swaps in a fresh session object asynchronously) —
-            # wait briefly before treating this as a failure, so a
-            # transient reconnect window doesn't burn a circuit-breaker
-            # strike (#26892).
-            if _wait_for_server_session_ready(
-                server, timeout=min(5.0, float(tool_timeout or 5.0)),
-            ):
-                pass  # Fresh session arrived; proceed below.
-            else:
-                # Still down — the server task is reconnecting, or it has
-                # exhausted its retry budget and parked (e.g. a dead stdio
-                # subprocess). Probing here would write into a dead/absent
-                # transport and re-arm the breaker forever (#16788). Instead,
-                # ask the (always-present) server task to rebuild the
-                # transport — which respawns a dead stdio subprocess — and
-                # return a clean "reconnecting" error so the model backs off
-                # without burning iterations. The breaker resets once the
-                # fresh session initializes (_run_stdio/_run_http call
-                # _reset_server_error).
-                _bump_server_error(server_name)
-                if _signal_reconnect(server):
-                    return tool_error(
-                        f"MCP server '{server_name}' transport is down; "
-                        f"reconnect requested. Do NOT retry this tool "
-                        f"immediately — give it a few seconds to come back."
-                    )
-                return tool_error(f"MCP server '{server_name}' is not connected")
 
         async def _call(*, read_only_session=None):
             _mark_server_call_started(server)
@@ -5095,16 +5116,7 @@ def _make_tool_handler(
 
         try:
             result = _call_once(read_only_session=governed_read_only_session)
-            # Check if the MCP tool itself returned an error
-            try:
-                parsed = json.loads(result)
-                if "error" in parsed:
-                    _bump_server_error(server_name)
-                else:
-                    _reset_server_error(server_name)  # success — reset
-            except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)  # non-JSON = success
-            return result
+            return _apply_mcp_result_accounting(server_name, result)
         except InterruptedError:
             return _interrupted_call_result()
         except Exception as exc:

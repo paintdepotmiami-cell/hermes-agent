@@ -53,6 +53,9 @@ _MAX_TRANSPORT_META_BYTES = 64 * 1024
 _MAX_TRANSPORT_META_FIELDS = 128
 _MAX_EVIDENCE_BYTES = 16 * 1024
 _FRESH_APPROVAL_TTL_SECONDS = 300.0
+_BREAKER_ACTION_IGNORE = "ignore"
+_BREAKER_ACTION_BUMP = "bump"
+_BREAKER_ACTION_RESET = "reset"
 _ANNOTATION_HINTS = (
     "readOnlyHint",
     "destructiveHint",
@@ -76,6 +79,13 @@ class _GovernanceViolation(RuntimeError):
 
 class _PreflightIndeterminate(RuntimeError):
     pass
+
+
+class _GovernedDispatchResult(str):
+    def __new__(cls, payload: str, *, breaker_action: str):
+        obj = str.__new__(cls, payload)
+        obj.breaker_action = breaker_action
+        return obj
 
 
 class _ReadOnlyObject:
@@ -627,6 +637,8 @@ class _GovernedServices:
         self._approval_receipt_issuer = object()
         self.dispatch_started = False
         self.dispatch_count = 0
+        self.transport_failed = False
+        self.transport_succeeded = False
         self._host_meta_atoms: list[object] = []
 
     @property
@@ -751,6 +763,7 @@ class _GovernedServices:
                 )
                 with self._lock:
                     self.preflight_completed = True
+                    self.transport_succeeded = True
                 return result
 
         from tools.mcp_tool import _run_on_mcp_loop
@@ -760,6 +773,8 @@ class _GovernedServices:
         except BaseException as exc:
             with self._lock:
                 started = self.preflight_started
+                if not isinstance(exc, _GovernanceViolation):
+                    self.transport_failed = True
                 if started:
                     self.preflight_indeterminate = True
                     if self._violation is None:
@@ -1020,6 +1035,7 @@ def _audit_json(
     summary: str,
     operation_hash: str | None = None,
     evidence: Mapping[str, Any] | None = None,
+    breaker_action: str = _BREAKER_ACTION_IGNORE,
 ) -> str:
     preflight_started = bool(services and services.preflight_started)
     preflight_completed = bool(services and services.preflight_completed)
@@ -1049,13 +1065,26 @@ def _audit_json(
             _deep_thaw(evidence),
             host_meta_atoms,
         )
-    return json.dumps(
-        payload,
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
+    return _GovernedDispatchResult(
+        json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        breaker_action=breaker_action,
     )
+
+
+def _services_breaker_action(services: _GovernedServices | None) -> str:
+    if services is None:
+        return _BREAKER_ACTION_IGNORE
+    if services.transport_failed:
+        return _BREAKER_ACTION_BUMP
+    if services.transport_succeeded:
+        return _BREAKER_ACTION_RESET
+    return _BREAKER_ACTION_IGNORE
 
 
 def _safe_outcome(outcome: object) -> tuple[str, str, Mapping[str, Any] | None]:
@@ -1162,6 +1191,7 @@ def dispatch_governed_mcp(
             services=services,
             summary="preflight outcome is unknown; target dispatch did not start",
             operation_hash=operation_hash,
+            breaker_action=_services_breaker_action(services),
         )
     if prepare_error is not None or services.violation is not None:
         return _audit_json(
@@ -1170,6 +1200,7 @@ def dispatch_governed_mcp(
             services=services,
             summary="governor preparation blocked the operation",
             operation_hash=operation_hash,
+            breaker_action=_services_breaker_action(services),
         )
 
     if type(plan) is ReadOnlyPassThrough:
@@ -1213,6 +1244,7 @@ def dispatch_governed_mcp(
                 services=services,
                 summary="read-only pass-through validation failed",
                 operation_hash=operation_hash,
+                breaker_action=_services_breaker_action(services),
             )
         return _READ_ONLY_PASS_THROUGH
 
@@ -1306,6 +1338,7 @@ def dispatch_governed_mcp(
             services=services,
             summary="bound plan validation or approval consumption failed",
             operation_hash=operation_hash,
+            breaker_action=_services_breaker_action(services),
         )
 
     async def _dispatch() -> Any:
@@ -1340,7 +1373,12 @@ def dispatch_governed_mcp(
 
     try:
         raw_result = _run_on_mcp_loop(_dispatch, timeout=tool_timeout)
+        with services._lock:
+            services.transport_succeeded = True
     except BaseException:
+        with services._lock:
+            if services.dispatch_started:
+                services.transport_failed = True
         return _audit_json(
             descriptor=descriptor,
             status="unknown" if services.dispatch_started else "blocked",
@@ -1351,6 +1389,7 @@ def dispatch_governed_mcp(
                 else "provider dispatch did not start after approval consumption"
             ),
             operation_hash=operation_hash,
+            breaker_action=_services_breaker_action(services),
         )
 
     try:
@@ -1376,6 +1415,7 @@ def dispatch_governed_mcp(
         summary=summary,
         operation_hash=operation_hash,
         evidence=evidence,
+        breaker_action=_services_breaker_action(services),
     )
 
 

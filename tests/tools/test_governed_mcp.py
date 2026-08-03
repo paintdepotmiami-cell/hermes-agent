@@ -75,6 +75,8 @@ def _run_direct(coro_or_factory, timeout=30):
 def isolated_governed_state(tmp_path, monkeypatch):
     tool_snapshot = registry._take_transaction_snapshot()
     server_snapshot = dict(mcp_tool._servers)
+    breaker_snapshot = dict(mcp_tool._server_error_counts)
+    breaker_opened_snapshot = dict(mcp_tool._server_breaker_opened_at)
     old_manager = plugin_module._plugin_manager
     old_coordinator = fresh_approval._DEFAULT_COORDINATOR
     empty_bundled = tmp_path / "empty-bundled"
@@ -97,6 +99,12 @@ def isolated_governed_state(tmp_path, monkeypatch):
         with mcp_tool._lock:
             mcp_tool._servers.clear()
             mcp_tool._servers.update(server_snapshot)
+            mcp_tool._server_error_counts.clear()
+            mcp_tool._server_error_counts.update(breaker_snapshot)
+            mcp_tool._server_breaker_opened_at.clear()
+            mcp_tool._server_breaker_opened_at.update(
+                breaker_opened_snapshot
+            )
         registry._restore_transaction_snapshot(tool_snapshot)
         for module_name in list(sys.modules):
             if module_name.startswith("hermes_plugins.neutral_governor_"):
@@ -1070,6 +1078,181 @@ def _install_governed_retry_reconnect(
         return True
 
     monkeypatch.setattr(mcp_tool, "_signal_reconnect_and_wait", reconnect)
+
+
+def _clear_governed_breaker_state():
+    mcp_tool._server_error_counts.pop(SERVER, None)
+    mcp_tool._server_breaker_opened_at.pop(SERVER, None)
+
+
+def test_governed_open_breaker_short_circuits_before_prepare(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "governed-breaker-open"
+    name = "neutral_governor_breaker_open"
+    _write_plugin(home, name, _capture_policy_source())
+    _manager, loaded = _discover_plugin(home, monkeypatch, name)
+    call_tool = AsyncMock()
+    _server_with_tools(_tool(EXECUTE), call_tool=call_tool)
+    try:
+        mcp_tool._server_error_counts[SERVER] = (
+            mcp_tool._CIRCUIT_BREAKER_THRESHOLD
+        )
+        mcp_tool._server_breaker_opened_at[SERVER] = time.monotonic()
+        with _trusted_scope(platform="local"):
+            result = json.loads(
+                registry.dispatch(
+                    mcp_tool.mcp_prefixed_tool_name(SERVER, EXECUTE),
+                    {"value": "sentinel"},
+                )
+            )
+    finally:
+        _clear_governed_breaker_state()
+
+    assert "error" in result
+    assert "unreachable" in result["error"].lower()
+    assert loaded.module.seen == []
+    call_tool.assert_not_awaited()
+
+
+def test_governed_preflight_transport_failures_trip_shared_breaker(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "governed-breaker-trip"
+    name = "neutral_governor_breaker_trip"
+    body = f'''        services.preflight_call(
+            {PREFLIGHT!r}, {{"probe": "sentinel"}}
+        )
+        raise AssertionError("preflight unexpectedly succeeded")'''
+    _write_plugin(home, name, _prepare_case_source(body))
+    _discover_plugin(home, monkeypatch, name)
+    call_tool = AsyncMock(side_effect=RuntimeError("preflight transport down"))
+    _server_with_tools(
+        _tool(EXECUTE),
+        _tool(PREFLIGHT),
+        call_tool=call_tool,
+    )
+    try:
+        threshold = mcp_tool._CIRCUIT_BREAKER_THRESHOLD
+        for expected_count in range(1, threshold + 1):
+            with _trusted_scope(platform="telegram"):
+                result = json.loads(
+                    registry.dispatch(
+                        mcp_tool.mcp_prefixed_tool_name(SERVER, EXECUTE),
+                        {"value": "sentinel"},
+                    )
+                )
+            assert result["status"] == "unknown"
+            assert result["preflight_started"] is True
+            assert result["preflight_completed"] is False
+            assert result["dispatch_started"] is False
+            assert (
+                mcp_tool._server_error_counts.get(SERVER, 0)
+                == expected_count
+            )
+
+        prepare_calls = len(plugin_module._plugin_manager._plugins[name].module.seen_services)
+        with _trusted_scope(platform="telegram"):
+            blocked = json.loads(
+                registry.dispatch(
+                    mcp_tool.mcp_prefixed_tool_name(SERVER, EXECUTE),
+                    {"value": "sentinel"},
+                )
+            )
+    finally:
+        _clear_governed_breaker_state()
+
+    assert "error" in blocked
+    assert "unreachable" in blocked["error"].lower()
+    assert len(plugin_module._plugin_manager._plugins[name].module.seen_services) == prepare_calls
+    assert call_tool.await_count == threshold
+
+
+def test_governed_prepare_block_does_not_bump_transport_breaker(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "governed-policy-block"
+    name = "neutral_governor_policy_block"
+    _write_plugin(home, name, _capture_policy_source())
+    _manager, loaded = _discover_plugin(home, monkeypatch, name)
+    call_tool = AsyncMock()
+    _server_with_tools(_tool(EXECUTE), call_tool=call_tool)
+    try:
+        mcp_tool._server_error_counts[SERVER] = 1
+        with _trusted_scope(platform="local"):
+            result = json.loads(
+                registry.dispatch(
+                    mcp_tool.mcp_prefixed_tool_name(SERVER, EXECUTE),
+                    {"value": "sentinel"},
+                )
+            )
+        post_count = mcp_tool._server_error_counts.get(SERVER, 0)
+    finally:
+        _clear_governed_breaker_state()
+
+    assert result["status"] == "blocked"
+    assert post_count == 1
+    assert len(loaded.module.seen) == 1
+    call_tool.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("case_name", "finalizer_body", "expected_status"),
+    [
+        (
+            "business_blocked",
+            '        return GovernedOutcome("blocked", "business rejected")',
+            "blocked",
+        ),
+        (
+            "finalizer_exception",
+            '        raise RuntimeError("finalizer unavailable")',
+            "unknown",
+        ),
+    ],
+)
+def test_governed_successful_dispatch_resets_breaker_accounting(
+    tmp_path, monkeypatch, case_name, finalizer_body, expected_status
+):
+    home = tmp_path / case_name
+    name = f"neutral_governor_breaker_reset_{case_name}"
+    _write_plugin(
+        home,
+        name,
+        _dispatch_only_policy_source(finalizer_body=finalizer_body),
+    )
+    _discover_plugin(home, monkeypatch, name)
+    call_tool = AsyncMock(
+        return_value=CallToolResult(
+            content=[TextContent(type="text", text="dispatch complete")]
+        )
+    )
+    _server_with_tools(_tool(EXECUTE), call_tool=call_tool)
+    clock = [8100.0]
+    coordinator = fresh_approval.FreshApprovalCoordinator(clock=lambda: clock[0])
+    monkeypatch.setattr(fresh_approval, "_DEFAULT_COORDINATOR", coordinator)
+    register_gateway_notify(
+        "neutral-telegram-session",
+        _auto_approve_notifier(coordinator, clock, []),
+    )
+    try:
+        mcp_tool._server_error_counts[SERVER] = 1
+        with _trusted_scope(platform="telegram"):
+            result = json.loads(
+                registry.dispatch(
+                    mcp_tool.mcp_prefixed_tool_name(SERVER, EXECUTE),
+                    {"value": "sentinel"},
+                )
+            )
+        post_count = mcp_tool._server_error_counts.get(SERVER, 0)
+    finally:
+        _clear_governed_breaker_state()
+
+    assert result["status"] == expected_status
+    assert result["dispatch_started"] is True
+    assert result["dispatch_count"] == 1
+    assert post_count == 0
+    call_tool.assert_awaited_once()
 
 
 @pytest.mark.parametrize("retry_kind", ["auth", "session-expired"])
