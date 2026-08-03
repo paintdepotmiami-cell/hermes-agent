@@ -2626,6 +2626,42 @@ def test_governed_preflight_marks_activity_before_sdk_call_and_avoids_idle_recyc
     assert server.session is session
 
 
+def test_governed_preflight_requires_activity_marker_before_sdk_call(
+    tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / "preflight-missing-activity-marker"
+    name = "neutral_governor_preflight_missing_activity_marker"
+    body = f'''        services.preflight_call(
+            {PREFLIGHT!r}, {{"probe": "sentinel"}}
+        )'''
+    _write_plugin(home, name, _prepare_case_source(body))
+    _discover_plugin(home, monkeypatch, name)
+    call_tool = AsyncMock()
+    _server_with_tools(
+        _tool(EXECUTE),
+        _tool(PREFLIGHT),
+        call_tool=call_tool,
+    )
+    monkeypatch.setattr(mcp_tool.MCPServerTask, "mark_tool_call", None)
+
+    with _trusted_scope(platform="telegram"):
+        result = json.loads(
+            registry.dispatch(
+                mcp_tool.mcp_prefixed_tool_name(SERVER, EXECUTE),
+                {"value": "sentinel"},
+            )
+        )
+
+    assert result["status"] == "blocked"
+    assert result["preflight_started"] is False
+    assert result["preflight_count"] == 0
+    assert result["dispatch_started"] is False
+    assert result["dispatch_count"] == 0
+    assert mcp_tool._server_error_counts.get(SERVER, 0) == 0
+    assert "required mark_tool_call activity marker is unavailable" in caplog.text
+    call_tool.assert_not_awaited()
+
+
 def test_governed_preflight_sets_pending_call_context_and_restores_prior_value(
     tmp_path, monkeypatch
 ):

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
+import logging
 import os
 import threading
 from types import MappingProxyType
@@ -64,6 +65,7 @@ _ANNOTATION_HINTS = (
 )
 _EMPTY_TRANSPORT_META: Mapping[str, Any] = MappingProxyType({})
 _READ_ONLY_PASS_THROUGH = object()
+logger = logging.getLogger(__name__)
 
 
 def _approved_at_rfc3339(confirmed_at: int | float) -> str:
@@ -756,8 +758,26 @@ class _GovernedServices:
                         "preflight target changed before SDK call"
                     )
                 mark_tool_call = getattr(self._server, "mark_tool_call", None)
-                if callable(mark_tool_call):
+                if not callable(mark_tool_call):
+                    logger.error(
+                        "Governed MCP preflight blocked for server %s: required "
+                        "mark_tool_call activity marker is unavailable",
+                        self._request.descriptor.server_name,
+                    )
+                    raise _GovernanceViolation(
+                        "MCP server activity marker is unavailable"
+                    )
+                try:
                     mark_tool_call()
+                except Exception:
+                    logger.error(
+                        "Governed MCP preflight blocked for server %s: "
+                        "mark_tool_call activity marker failed",
+                        self._request.descriptor.server_name,
+                    )
+                    raise _GovernanceViolation(
+                        "MCP server activity marker failed"
+                    ) from None
                 with self._lock:
                     self.preflight_started = True
                     self.preflight_count = 1
