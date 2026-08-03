@@ -211,6 +211,9 @@ def build_mcp_tool_descriptor(
     input_schema = getattr(tool, "inputSchema", None)
     if not isinstance(input_schema, Mapping):
         raise ValueError("descriptor input schema must be an object")
+    output_schema = getattr(tool, "outputSchema", None)
+    if output_schema is not None and not isinstance(output_schema, Mapping):
+        raise ValueError("descriptor output schema must be an object or None")
 
     dumped = _model_dump(tool, exclude_unset=True) or {}
     raw_annotations = getattr(tool, "annotations", None)
@@ -237,6 +240,7 @@ def build_mcp_tool_descriptor(
         "input_schema": input_schema,
         "meta": meta,
         "normalized_name": normalized_name,
+        "output_schema": output_schema,
         "raw_tool_name": raw_tool_name,
         "server_name": server_name,
     }
@@ -247,6 +251,7 @@ def build_mcp_tool_descriptor(
         normalized_name=normalized_name,
         description=description,
         input_schema=input_schema,
+        output_schema=output_schema,
         annotations=annotations,
         meta=meta,
         fingerprint=fingerprint,

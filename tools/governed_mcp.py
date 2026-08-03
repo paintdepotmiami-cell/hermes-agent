@@ -75,12 +75,17 @@ class MCPToolDescriptor:
     normalized_name: str
     description: str | None
     input_schema: Mapping[str, Any]
+    output_schema: Mapping[str, Any] | None
     annotations: Mapping[str, Any] | None
     meta: Mapping[str, Any] | None
     fingerprint: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "input_schema", _deep_freeze(self.input_schema))
+        if self.output_schema is not None:
+            object.__setattr__(
+                self, "output_schema", _deep_freeze(self.output_schema)
+            )
         if self.annotations is not None:
             object.__setattr__(
                 self, "annotations", _deep_freeze(self.annotations)

@@ -180,6 +180,7 @@ def _tool(
     *,
     annotations: ToolAnnotations | None = None,
     meta: dict | None = None,
+    output_schema: dict | None = None,
 ) -> Tool:
     values = {
         "name": name,
@@ -198,6 +199,8 @@ def _tool(
         values["annotations"] = annotations
     if meta is not None:
         values["_meta"] = meta
+    if output_schema is not None:
+        values["outputSchema"] = output_schema
     return Tool(**values)
 
 
@@ -471,6 +474,7 @@ def test_public_contract_is_immutable_and_host_capabilities_are_host_only():
         normalized_name=mcp_tool.mcp_prefixed_tool_name(SERVER, PREPARE),
         description="read-only descriptor",
         input_schema={"type": "object", "properties": {}},
+        output_schema=None,
         annotations={"readOnlyHint": True},
         meta=None,
         fingerprint="f" * 64,
@@ -530,6 +534,10 @@ def test_descriptor_preserves_real_sdk_aliases_and_absence(
         EXECUTE,
         annotations=annotations,
         meta={"neutralAlias": {"present": True}},
+        output_schema={
+            "type": "object",
+            "properties": {"result": {"type": "string"}},
+        },
     )
     session_call = AsyncMock()
     _server, _session, registered = _server_with_tools(execute)
@@ -559,6 +567,10 @@ def test_descriptor_preserves_real_sdk_aliases_and_absence(
     assert descriptor.input_schema["properties"]["value"] == {
         "type": "string"
     }
+    assert descriptor.output_schema == {
+        "type": "object",
+        "properties": {"result": {"type": "string"}},
+    }
     assert descriptor.annotations["readOnlyHint"] is None
     assert descriptor.annotations["destructiveHint"] is True
     assert descriptor.annotations["idempotentHint"] is False
@@ -567,6 +579,8 @@ def test_descriptor_preserves_real_sdk_aliases_and_absence(
     assert len(descriptor.fingerprint) == 64
     with pytest.raises(TypeError):
         descriptor.input_schema["type"] = "array"
+    with pytest.raises(TypeError):
+        descriptor.output_schema["type"] = "array"
     with pytest.raises(TypeError):
         request.arguments["value"] = "changed"
 
@@ -605,6 +619,7 @@ def test_descriptor_fingerprint_changes_with_every_contract_field():
                 name="different-tool",
                 description=base_tool.description,
                 inputSchema=base_tool.inputSchema,
+                outputSchema=base_tool.outputSchema,
                 annotations=base_tool.annotations,
                 _meta=base_tool.meta,
             ),
@@ -617,6 +632,7 @@ def test_descriptor_fingerprint_changes_with_every_contract_field():
                 name=EXECUTE,
                 description="different description",
                 inputSchema=base_tool.inputSchema,
+                outputSchema=base_tool.outputSchema,
                 annotations=base_tool.annotations,
                 _meta=base_tool.meta,
             ),
@@ -628,6 +644,7 @@ def test_descriptor_fingerprint_changes_with_every_contract_field():
                 name=EXECUTE,
                 description=base_tool.description,
                 inputSchema={"type": "object", "properties": {}},
+                outputSchema=base_tool.outputSchema,
                 annotations=base_tool.annotations,
                 _meta=base_tool.meta,
             ),
@@ -639,6 +656,7 @@ def test_descriptor_fingerprint_changes_with_every_contract_field():
                 name=EXECUTE,
                 description=base_tool.description,
                 inputSchema=base_tool.inputSchema,
+                outputSchema=base_tool.outputSchema,
                 annotations=ToolAnnotations(readOnlyHint=False),
                 _meta=base_tool.meta,
             ),
@@ -650,8 +668,21 @@ def test_descriptor_fingerprint_changes_with_every_contract_field():
                 name=EXECUTE,
                 description=base_tool.description,
                 inputSchema=base_tool.inputSchema,
+                outputSchema=base_tool.outputSchema,
                 annotations=base_tool.annotations,
                 _meta={"neutral": "different"},
+            ),
+        ),
+        build_mcp_tool_descriptor(
+            SERVER,
+            "normalized-base",
+            Tool(
+                name=EXECUTE,
+                description=base_tool.description,
+                inputSchema=base_tool.inputSchema,
+                outputSchema={"type": "object", "properties": {}},
+                annotations=base_tool.annotations,
+                _meta=base_tool.meta,
             ),
         ),
     ]
@@ -981,6 +1012,105 @@ def test_governed_read_only_refresh_drift_blocks_before_sdk_call(
     original_call.assert_not_awaited()
     replacement_call.assert_not_awaited()
     assert original_session is not server.session
+
+
+@pytest.mark.parametrize(
+    ("refreshed_output_schema", "expected_result", "expected_calls"),
+    [
+        (
+            {
+                "type": "object",
+                "properties": {"result": {"type": "number"}},
+            },
+            "blocked",
+            0,
+        ),
+        (
+            {
+                "properties": {"result": {"type": "string"}},
+                "type": "object",
+            },
+            "read-safe-result",
+            1,
+        ),
+    ],
+)
+def test_governed_read_only_refresh_revalidates_output_schema(
+    tmp_path,
+    monkeypatch,
+    refreshed_output_schema,
+    expected_result,
+    expected_calls,
+):
+    home = tmp_path / f"read-only-output-schema-{expected_calls}"
+    name = f"neutral_governor_read_only_output_schema_{expected_calls}"
+    _write_plugin(home, name, _read_only_policy_source())
+    _discover_plugin(home, monkeypatch, name)
+    base_output_schema = {
+        "type": "object",
+        "properties": {"result": {"type": "string"}},
+    }
+    call_tool = AsyncMock(
+        return_value=CallToolResult(
+            content=[TextContent(type="text", text="read-safe-result")]
+        )
+    )
+    server, session, registered = _server_with_tools(
+        _tool(
+            READ,
+            annotations=ToolAnnotations(readOnlyHint=True),
+            output_schema=base_output_schema,
+        ),
+        call_tool=call_tool,
+    )
+    gate_entered = threading.Event()
+    release_gate = threading.Event()
+    original_run_on_mcp_loop = mcp_tool._run_on_mcp_loop
+
+    def gate_run_on_mcp_loop(coro_or_factory, timeout=30):
+        if not gate_entered.is_set():
+            gate_entered.set()
+            assert release_gate.wait(timeout=5), "legacy call did not pause"
+        return original_run_on_mcp_loop(coro_or_factory, timeout=timeout)
+
+    monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", gate_run_on_mcp_loop)
+    session.list_tools = AsyncMock(
+        return_value=SimpleNamespace(
+            tools=[
+                _tool(
+                    READ,
+                    annotations=ToolAnnotations(readOnlyHint=True),
+                    output_schema=refreshed_output_schema,
+                )
+            ],
+            nextCursor=None,
+        )
+    )
+    observed = {}
+
+    def invoke():
+        with _trusted_scope(platform="local"):
+            observed["raw"] = registry.dispatch(
+                registered[0],
+                {"value": "read-sentinel"},
+            )
+
+    worker = threading.Thread(target=invoke, daemon=True)
+    worker.start()
+    assert gate_entered.wait(timeout=5), "governed legacy handoff did not pause"
+    original_run_on_mcp_loop(server._refresh_tools, timeout=30)
+    release_gate.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    result = json.loads(observed["raw"])
+    if expected_calls:
+        assert result == {"result": expected_result}
+    else:
+        assert result["status"] == expected_result
+        assert result["dispatch_started"] is False
+        assert result["dispatch_count"] == 0
+    assert call_tool.await_count == expected_calls
 
 
 def test_governed_read_only_unchanged_target_calls_sdk_once_after_pause(
