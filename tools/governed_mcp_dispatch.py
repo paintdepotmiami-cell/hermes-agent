@@ -477,6 +477,15 @@ def _sanitize_host_meta_values(
     return _sanitize(value)
 
 
+async def _call_with_pending_context(server: Any, invoke: Any) -> Any:
+    previous_context = getattr(server, "_pending_call_context", None)
+    server._pending_call_context = contextvars.copy_context()
+    try:
+        return await invoke()
+    finally:
+        server._pending_call_context = previous_context
+
+
 def _current_server(server_name: str) -> Any | None:
     from tools import mcp_tool
 
@@ -712,10 +721,13 @@ class _GovernedServices:
                 with self._lock:
                     self.preflight_started = True
                     self.preflight_count = 1
-                result = await self._session.call_tool(
-                    raw_tool_name,
-                    arguments=call_arguments,
-                    meta=call_meta or None,
+                result = await _call_with_pending_context(
+                    self._server,
+                    lambda: self._session.call_tool(
+                        raw_tool_name,
+                        arguments=call_arguments,
+                        meta=call_meta or None,
+                    ),
                 )
                 with self._lock:
                     self.preflight_completed = True
@@ -1285,21 +1297,20 @@ def dispatch_governed_mcp(
             mark_tool_call = getattr(server, "mark_tool_call", None)
             if callable(mark_tool_call):
                 mark_tool_call()
-            server._pending_call_context = contextvars.copy_context()
-            try:
-                # The marker is intentionally adjacent to the one SDK call:
-                # any failure above this point remains blocked, while every
-                # exception/cancellation from the call itself is unknown.
-                with services._lock:
-                    services.dispatch_started = True
-                    services.dispatch_count = 1
-                return await session.call_tool(
+            # The marker is intentionally adjacent to the one SDK call:
+            # any failure above this point remains blocked, while every
+            # exception/cancellation from the call itself is unknown.
+            with services._lock:
+                services.dispatch_started = True
+                services.dispatch_count = 1
+            return await _call_with_pending_context(
+                server,
+                lambda: session.call_tool(
                     state.target_descriptor.raw_tool_name,
                     arguments=merged_arguments,
                     meta=merged_meta or None,
-                )
-            finally:
-                server._pending_call_context = None
+                ),
+            )
 
     from tools.mcp_tool import _run_on_mcp_loop
 

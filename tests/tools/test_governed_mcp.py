@@ -30,7 +30,7 @@ from agent._trusted_interaction_issuer import (
     _reset_trusted_interaction,
 )
 from agent.trusted_interaction import get_current_trusted_interaction
-from gateway.session_context import clear_session_vars, set_session_vars
+from gateway.session_context import clear_session_vars, get_session_env, set_session_vars
 from hermes_cli import plugins as plugin_module
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 from tools import fresh_approval, mcp_tool
@@ -2135,6 +2135,138 @@ def test_preflight_failure_after_sdk_call_begins_is_unknown_and_never_retried(
     assert result["dispatch_started"] is False
     assert result["dispatch_count"] == 0
     assert len(calls) == 1
+
+
+def test_governed_preflight_sets_pending_call_context_and_restores_prior_value(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "preflight-pending-context-success"
+    name = "neutral_governor_preflight_pending_context_success"
+    body = f'''        services.preflight_call(
+            {PREFLIGHT!r}, {{"probe": "sentinel"}}
+        )
+        raise RuntimeError("stop after preflight")'''
+    _write_plugin(home, name, _prepare_case_source(body))
+    _discover_plugin(home, monkeypatch, name)
+
+    import contextvars
+
+    prior_probe: contextvars.ContextVar[str] = contextvars.ContextVar(
+        "prior_preflight_pending_context", default=""
+    )
+    prior_token = prior_probe.set("prior-context")
+    try:
+        prior_context = contextvars.copy_context()
+    finally:
+        prior_probe.reset(prior_token)
+
+    observed = {}
+
+    async def call_tool(raw_name, arguments, *, meta=None):
+        del raw_name, arguments, meta
+        pending = getattr(server, "_pending_call_context", None)
+        observed["pending"] = pending
+        observed["session_key"] = (
+            None
+            if pending is None
+            else pending.run(
+                lambda: get_current_trusted_interaction().session_key
+            )
+        )
+        observed["session_platform"] = (
+            None
+            if pending is None
+            else pending.run(
+                lambda: get_session_env("HERMES_SESSION_PLATFORM", "")
+            )
+        )
+        observed["prior_probe"] = (
+            None if pending is None else pending.run(prior_probe.get)
+        )
+        return CallToolResult(
+            content=[TextContent(type="text", text="preflight complete")]
+        )
+
+    server, _session, _registered = _server_with_tools(
+        _tool(EXECUTE),
+        _tool(PREFLIGHT),
+        call_tool=call_tool,
+    )
+    server._pending_call_context = prior_context
+
+    with _trusted_scope(platform="telegram"):
+        result = json.loads(
+            registry.dispatch(
+                mcp_tool.mcp_prefixed_tool_name(SERVER, EXECUTE),
+                {"value": "sentinel"},
+            )
+        )
+
+    assert result["status"] == "blocked"
+    assert result["preflight_started"] is True
+    assert result["preflight_completed"] is True
+    assert observed["pending"] is not None
+    assert observed["pending"] is not prior_context
+    assert observed["session_key"] == "neutral-telegram-session"
+    assert observed["session_platform"] == "telegram"
+    assert observed["prior_probe"] == ""
+    assert server._pending_call_context is prior_context
+
+
+def test_governed_preflight_clears_pending_call_context_after_sdk_exception(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "preflight-pending-context-failure"
+    name = "neutral_governor_preflight_pending_context_failure"
+    body = f'''        services.preflight_call(
+            {PREFLIGHT!r}, {{"probe": "sentinel"}}
+        )'''
+    _write_plugin(home, name, _prepare_case_source(body))
+    _discover_plugin(home, monkeypatch, name)
+    observed = {}
+
+    async def call_tool(raw_name, arguments, *, meta=None):
+        del raw_name, arguments, meta
+        pending = getattr(server, "_pending_call_context", None)
+        observed["pending"] = pending
+        observed["session_key"] = (
+            None
+            if pending is None
+            else pending.run(
+                lambda: get_current_trusted_interaction().session_key
+            )
+        )
+        observed["session_platform"] = (
+            None
+            if pending is None
+            else pending.run(
+                lambda: get_session_env("HERMES_SESSION_PLATFORM", "")
+            )
+        )
+        raise RuntimeError("preflight provider error")
+
+    server, _session, _registered = _server_with_tools(
+        _tool(EXECUTE),
+        _tool(PREFLIGHT),
+        call_tool=call_tool,
+    )
+    server._pending_call_context = None
+
+    with _trusted_scope(platform="telegram"):
+        result = json.loads(
+            registry.dispatch(
+                mcp_tool.mcp_prefixed_tool_name(SERVER, EXECUTE),
+                {"value": "sentinel"},
+            )
+        )
+
+    assert result["status"] == "unknown"
+    assert result["preflight_started"] is True
+    assert result["preflight_completed"] is False
+    assert observed["pending"] is not None
+    assert observed["session_key"] == "neutral-telegram-session"
+    assert observed["session_platform"] == "telegram"
+    assert server._pending_call_context is None
 
 
 def _approval_policy_source(
