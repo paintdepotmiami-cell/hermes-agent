@@ -915,45 +915,145 @@ def test_real_sdk_read_only_hint_true_uses_closed_legacy_handler_exactly_once(
     assert calls == [(READ, {"value": "read-sentinel"})]
 
 
-def test_read_only_pass_through_preserves_legacy_retry_path(
-    tmp_path, monkeypatch
+def _install_governed_retry_reconnect(
+    monkeypatch,
+    server,
+    *,
+    retry_kind: str,
+    replacement_session,
+    on_reconnect=None,
 ):
-    home = tmp_path / "home"
-    name = "neutral_governor_read_retry"
-    _write_plugin(home, name, _read_only_policy_source())
-    _manager, loaded = _discover_plugin(home, monkeypatch, name)
-    calls = []
+    if retry_kind == "auth":
+        monkeypatch.setattr(mcp_tool, "_is_auth_error", lambda exc: True)
 
-    async def flaky_read(raw_name, arguments):
-        calls.append((raw_name, dict(arguments)))
-        if len(calls) == 1:
-            raise RuntimeError("synthetic auth failure")
-        return CallToolResult(
-            content=[TextContent(type="text", text="retried-read-result")]
+        class _Manager:
+            async def handle_401(self, server_name, _response):
+                assert server_name == SERVER
+                return True
+
+        monkeypatch.setattr(
+            "tools.mcp_oauth_manager.get_manager",
+            lambda: _Manager(),
+        )
+    else:
+        monkeypatch.setattr(
+            mcp_tool,
+            "_is_session_expired_error",
+            lambda exc: True,
+        )
+        monkeypatch.setattr(
+            mcp_tool,
+            "_mcp_loop",
+            SimpleNamespace(is_running=lambda: True),
         )
 
-    def retry_once(server_name, exc, call_once, operation):
+    def reconnect(server_name, srv, *, op_description, timeout):
         assert server_name == SERVER
-        assert isinstance(exc, RuntimeError)
-        assert operation == f"tools/call {READ}"
-        return call_once()
+        assert srv is server
+        assert timeout == 15
+        if retry_kind == "auth":
+            assert op_description == f"tools/call {READ} after OAuth recovery"
+        else:
+            assert op_description == f"tools/call {READ}"
+        server.session = replacement_session
+        if on_reconnect is not None:
+            on_reconnect()
+        return True
 
-    monkeypatch.setattr(mcp_tool, "_handle_auth_error_and_retry", retry_once)
-    _server_with_tools(
-        _tool(READ, annotations=ToolAnnotations(readOnlyHint=True)),
-        call_tool=flaky_read,
+    monkeypatch.setattr(mcp_tool, "_signal_reconnect_and_wait", reconnect)
+
+
+@pytest.mark.parametrize("retry_kind", ["auth", "session-expired"])
+def test_governed_read_only_retry_revalidates_same_descriptor_once(
+    tmp_path, monkeypatch, retry_kind
+):
+    home = tmp_path / retry_kind
+    name = f"neutral_governor_read_retry_{retry_kind}"
+    _write_plugin(home, name, _read_only_policy_source())
+    _discover_plugin(home, monkeypatch, name)
+
+    original_call = AsyncMock(side_effect=RuntimeError(f"synthetic {retry_kind} failure"))
+    replacement_call = AsyncMock(
+        return_value=CallToolResult(
+            content=[TextContent(type="text", text=f"{retry_kind}-retried-read-result")]
+        )
     )
+    server, _original_session, _registered = _server_with_tools(
+        _tool(READ, annotations=ToolAnnotations(readOnlyHint=True)),
+        call_tool=original_call,
+    )
+    replacement_session = SimpleNamespace(call_tool=replacement_call)
+    _install_governed_retry_reconnect(
+        monkeypatch,
+        server,
+        retry_kind=retry_kind,
+        replacement_session=replacement_session,
+    )
+
     with _trusted_scope(platform="local"):
         raw = registry.dispatch(
             mcp_tool.mcp_prefixed_tool_name(SERVER, READ),
             {"value": "read-sentinel"},
         )
 
-    assert json.loads(raw) == {"result": "retried-read-result"}
-    assert calls == [
-        (READ, {"value": "read-sentinel"}),
-        (READ, {"value": "read-sentinel"}),
-    ]
+    assert json.loads(raw) == {"result": f"{retry_kind}-retried-read-result"}
+    original_call.assert_awaited_once_with(
+        READ, arguments={"value": "read-sentinel"}
+    )
+    replacement_call.assert_awaited_once_with(
+        READ, arguments={"value": "read-sentinel"}
+    )
+
+
+@pytest.mark.parametrize("retry_kind", ["auth", "session-expired"])
+def test_governed_read_only_retry_blocks_reconnect_descriptor_drift(
+    tmp_path, monkeypatch, retry_kind
+):
+    home = tmp_path / f"{retry_kind}-drift"
+    name = f"neutral_governor_read_retry_drift_{retry_kind}"
+    _write_plugin(home, name, _read_only_policy_source())
+    _discover_plugin(home, monkeypatch, name)
+
+    original_call = AsyncMock(side_effect=RuntimeError(f"synthetic {retry_kind} failure"))
+    replacement_call = AsyncMock()
+    server, _original_session, _registered = _server_with_tools(
+        _tool(READ, annotations=ToolAnnotations(readOnlyHint=True)),
+        call_tool=original_call,
+    )
+    replacement_session = SimpleNamespace(call_tool=replacement_call)
+    _install_governed_retry_reconnect(
+        monkeypatch,
+        server,
+        retry_kind=retry_kind,
+        replacement_session=replacement_session,
+        on_reconnect=lambda: setattr(
+            server,
+            "_tools",
+            [
+                _tool(
+                    READ,
+                    annotations=ToolAnnotations(readOnlyHint=True),
+                    meta={"drift": retry_kind},
+                )
+            ],
+        ),
+    )
+
+    with _trusted_scope(platform="local"):
+        result = json.loads(
+            registry.dispatch(
+                mcp_tool.mcp_prefixed_tool_name(SERVER, READ),
+                {"value": "read-sentinel"},
+            )
+        )
+
+    assert result["status"] == "blocked"
+    assert result["dispatch_count"] == 0
+    assert result["dispatch_started"] is False
+    original_call.assert_awaited_once_with(
+        READ, arguments={"value": "read-sentinel"}
+    )
+    replacement_call.assert_not_awaited()
 
 
 @pytest.mark.parametrize("reconnect_origin", ["manual", "auth", "stdio"])

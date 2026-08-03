@@ -4802,6 +4802,7 @@ def _make_tool_handler(
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        governed_read_only_retry = None
         # Exact-server governors are selected at invocation so a transactional
         # plugin load/force-reload never requires rebuilding the model tool
         # schema. Their handler snapshot, however, is discovery-owned: session
@@ -4879,6 +4880,22 @@ def _make_tool_handler(
             )
             if governed_result is not _READ_ONLY_PASS_THROUGH:
                 return governed_result
+
+            def _retry_read_only_governed_call() -> str:
+                retry_session = getattr(governed_server, "session", None)
+                retry_result = dispatch_governed_mcp(
+                    registration=governor,
+                    descriptor=governed_descriptor,
+                    server=governed_server,
+                    session=retry_session,
+                    arguments=args,
+                    tool_timeout=tool_timeout,
+                )
+                if retry_result is not _READ_ONLY_PASS_THROUGH:
+                    return retry_result
+                return _call_once()
+
+            governed_read_only_retry = _retry_read_only_governed_call
 
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
@@ -5040,6 +5057,8 @@ def _make_tool_handler(
         def _call_once():
             return _run_on_mcp_loop(_call, timeout=tool_timeout)
 
+        retry_call = governed_read_only_retry or _call_once
+
         try:
             result = _call_once()
             # Check if the MCP tool itself returned an error
@@ -5059,7 +5078,7 @@ def _make_tool_handler(
             # reconnect if viable, retry once. Returns None to fall
             # through for non-auth exceptions.
             recovered = _handle_auth_error_and_retry(
-                server_name, exc, _call_once,
+                server_name, exc, retry_call,
                 f"tools/call {tool_name}",
             )
             if recovered is not None:
@@ -5069,7 +5088,7 @@ def _make_tool_handler(
             # but skips OAuth recovery because the access token is
             # still valid — only the server-side session is stale.
             recovered = _handle_session_expired_and_retry(
-                server_name, exc, _call_once,
+                server_name, exc, retry_call,
                 f"tools/call {tool_name}",
             )
             if recovered is not None:
