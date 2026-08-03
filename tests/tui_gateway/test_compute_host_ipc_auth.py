@@ -22,6 +22,7 @@ from tui_gateway.compute_host import ComputeHost
 _IPC_MAC_KEY_ENV = "HERMES_COMPUTE_HOST_IPC_MAC_KEY"
 _FIRST_KEY = bytes(range(32))
 _SECOND_KEY = bytes(reversed(range(32)))
+_TRUE_SUBPROCESS_POPEN = host_module.subprocess.Popen
 
 
 class _CaptureStdin:
@@ -132,6 +133,20 @@ def _supervisor_with_fake_spawn(tmp_path, monkeypatch, keys):
     )
     supervisor._hello_event = _ReadyEvent(supervisor, str(tmp_path))
     return supervisor, captured
+
+
+def _thread_scoped_popen(
+    *,
+    target_thread_id: int,
+    target_popen,
+    fallback_popen,
+):
+    def _guarded_popen(*args, **kwargs):
+        if threading.get_ident() == target_thread_id:
+            return target_popen(*args, **kwargs)
+        return fallback_popen(*args, **kwargs)
+
+    return _guarded_popen
 
 
 def _last_sent_frame(proc: _FakeProc) -> dict:
@@ -284,12 +299,65 @@ def test_supervisor_spawn_fails_before_popen_when_final_policy_strips_key(
         "scrub_private_secret_env",
         strip_ipc_key,
     )
-    monkeypatch.setattr(host_module.subprocess, "Popen", forbidden_popen)
+    monkeypatch.setattr(
+        host_module.subprocess,
+        "Popen",
+        _thread_scoped_popen(
+            target_thread_id=threading.get_ident(),
+            target_popen=forbidden_popen,
+            fallback_popen=_TRUE_SUBPROCESS_POPEN,
+        ),
+    )
 
     with pytest.raises(RuntimeError, match="IPC MAC"):
         supervisor._spawn_locked(reason="test")
 
     assert popen_called is False
+
+
+def test_thread_scoped_popen_blocks_only_target_thread():
+    calls: list[tuple[str, int]] = []
+    worker_ready = threading.Barrier(2, timeout=5)
+    worker_done = threading.Event()
+    worker_result: dict[str, object] = {}
+    sentinel = object()
+
+    def target_popen(*args, **kwargs):
+        del args, kwargs
+        calls.append(("target", threading.get_ident()))
+        raise AssertionError("target thread must be blocked")
+
+    def fallback_popen(*args, **kwargs):
+        del args, kwargs
+        calls.append(("fallback", threading.get_ident()))
+        return sentinel
+
+    guarded = _thread_scoped_popen(
+        target_thread_id=threading.get_ident(),
+        target_popen=target_popen,
+        fallback_popen=fallback_popen,
+    )
+
+    def worker():
+        worker_ready.wait()
+        worker_result["value"] = guarded("worker")
+        worker_done.set()
+
+    thread = threading.Thread(target=worker, name="popen-worker")
+    thread.start()
+    worker_ready.wait()
+    assert worker_done.wait(timeout=5) is True
+    thread.join(timeout=5)
+    assert thread.is_alive() is False
+    assert worker_result["value"] is sentinel
+
+    with pytest.raises(AssertionError, match="target thread"):
+        guarded("main")
+
+    assert calls == [
+        ("fallback", thread.ident),
+        ("target", threading.get_ident()),
+    ]
 
 
 def test_supervisor_respawn_rotates_key_and_invalidates_old_frame(
