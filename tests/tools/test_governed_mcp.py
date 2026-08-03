@@ -2328,6 +2328,156 @@ def register(ctx):
 '''
 
 
+def _dispatch_only_policy_source(
+    *,
+    finalizer_body: str = '        return GovernedOutcome("verified", "dispatch verified")',
+) -> str:
+    return f'''from tools.governed_mcp import GovernedDispatchPlan, GovernedOutcome
+
+class Policy:
+    def prepare(self, request, services):
+        operation = services.bind_operation(
+            {EXECUTE!r},
+            request.arguments,
+            proposal_hash="neutral-proposal-hash",
+            preview="neutral preview",
+            display_text="neutral display",
+        )
+        receipt = services.request_fresh_approval(operation)
+        return GovernedDispatchPlan(operation, receipt, {{}}, {{}})
+
+    def finalize(self, request, operation, result):
+{finalizer_body}
+
+def register(ctx):
+    ctx.register_mcp_governor({SERVER!r}, Policy())
+'''
+
+
+def test_governed_preflight_success_marks_session_proven(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "preflight-proven"
+    name = "neutral_governor_preflight_proven"
+    body = f'''        services.preflight_call(
+            {PREFLIGHT!r}, {{"probe": "sentinel"}}
+        )
+        raise RuntimeError("stop after preflight")'''
+    _write_plugin(home, name, _prepare_case_source(body))
+    _discover_plugin(home, monkeypatch, name)
+
+    async def call_tool(raw_name, arguments, *, meta=None):
+        del raw_name, arguments, meta
+        return CallToolResult(
+            content=[TextContent(type="text", text="preflight complete")]
+        )
+
+    server, _session, _registered = _server_with_tools(
+        _tool(EXECUTE),
+        _tool(PREFLIGHT),
+        call_tool=call_tool,
+    )
+    server._session_proven = False
+    server._reconnect_retries = 3
+
+    with _trusted_scope(platform="telegram"):
+        result = json.loads(
+            registry.dispatch(
+                mcp_tool.mcp_prefixed_tool_name(SERVER, EXECUTE),
+                {"value": "sentinel"},
+            )
+        )
+
+    assert result["status"] == "blocked"
+    assert result["preflight_completed"] is True
+    assert result["dispatch_count"] == 0
+    assert server._session_proven is True
+    assert server._reconnect_retries == 0
+
+
+def test_governed_final_dispatch_success_marks_session_proven(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "dispatch-proven"
+    name = "neutral_governor_dispatch_proven"
+    _write_plugin(home, name, _dispatch_only_policy_source())
+    _discover_plugin(home, monkeypatch, name)
+
+    async def call_tool(raw_name, arguments, *, meta=None):
+        del arguments, meta
+        assert raw_name == EXECUTE
+        return CallToolResult(
+            content=[TextContent(type="text", text="dispatch complete")]
+        )
+
+    server, _session, _registered = _server_with_tools(
+        _tool(EXECUTE),
+        call_tool=call_tool,
+    )
+    server._session_proven = False
+    server._reconnect_retries = 4
+    clock = [7000.0]
+    coordinator = fresh_approval.FreshApprovalCoordinator(clock=lambda: clock[0])
+    monkeypatch.setattr(fresh_approval, "_DEFAULT_COORDINATOR", coordinator)
+    register_gateway_notify(
+        "neutral-telegram-session",
+        _auto_approve_notifier(coordinator, clock, []),
+    )
+
+    with _trusted_scope(platform="telegram"):
+        result = json.loads(
+            registry.dispatch(
+                mcp_tool.mcp_prefixed_tool_name(SERVER, EXECUTE),
+                {"value": "sentinel"},
+            )
+        )
+
+    assert result["status"] == "verified"
+    assert result["dispatch_count"] == 1
+    assert server._session_proven is True
+    assert server._reconnect_retries == 0
+
+
+def test_governed_final_dispatch_failure_does_not_mark_session_proven(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "dispatch-unproven"
+    name = "neutral_governor_dispatch_unproven"
+    _write_plugin(home, name, _dispatch_only_policy_source())
+    _discover_plugin(home, monkeypatch, name)
+
+    async def call_tool(raw_name, arguments, *, meta=None):
+        del raw_name, arguments, meta
+        raise RuntimeError("dispatch failed")
+
+    server, _session, _registered = _server_with_tools(
+        _tool(EXECUTE),
+        call_tool=call_tool,
+    )
+    server._session_proven = False
+    server._reconnect_retries = 5
+    clock = [7100.0]
+    coordinator = fresh_approval.FreshApprovalCoordinator(clock=lambda: clock[0])
+    monkeypatch.setattr(fresh_approval, "_DEFAULT_COORDINATOR", coordinator)
+    register_gateway_notify(
+        "neutral-telegram-session",
+        _auto_approve_notifier(coordinator, clock, []),
+    )
+
+    with _trusted_scope(platform="telegram"):
+        result = json.loads(
+            registry.dispatch(
+                mcp_tool.mcp_prefixed_tool_name(SERVER, EXECUTE),
+                {"value": "sentinel"},
+            )
+        )
+
+    assert result["status"] == "unknown"
+    assert result["dispatch_started"] is True
+    assert server._session_proven is False
+    assert server._reconnect_retries == 5
+
+
 def _approval_notifier_for_mode(coordinator, clock, mode):
     def notify(data):
         request = coordinator.get_request(data["approval_id"])

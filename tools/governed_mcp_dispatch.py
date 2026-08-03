@@ -481,7 +481,11 @@ async def _call_with_pending_context(server: Any, invoke: Any) -> Any:
     previous_context = getattr(server, "_pending_call_context", None)
     server._pending_call_context = contextvars.copy_context()
     try:
-        return await invoke()
+        result = await invoke()
+        mark_proven = getattr(server, "_mark_session_proven", None)
+        if mark_proven is not None:
+            mark_proven()
+        return result
     finally:
         server._pending_call_context = previous_context
 
