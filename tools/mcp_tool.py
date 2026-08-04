@@ -2780,9 +2780,9 @@ class MCPServerTask:
         ssl_verify = config.get("ssl_verify", True)
         client_cert = _resolve_client_cert(self.name, config)
 
-        # OAuth 2.1 PKCE: route through the central MCPOAuthManager so the
-        # same provider instance is reused across reconnects, pre-flow
-        # disk-watch is active, and config-time CLI code paths share state.
+        # OAuth: route browser PKCE and autonomous client-credentials flows
+        # through the central MCPOAuthManager so the provider is reused across
+        # reconnects and config-time CLI code paths share state.
         # If OAuth setup fails (e.g. non-interactive env without cached
         # tokens), re-raise so this server is reported as failed without
         # blocking other MCP servers from connecting.
