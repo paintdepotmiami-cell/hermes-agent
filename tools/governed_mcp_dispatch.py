@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 from collections.abc import Mapping, Sequence
 import contextvars
 from datetime import datetime, timezone
@@ -58,15 +59,6 @@ _FRESH_APPROVAL_TTL_SECONDS = 300.0
 _BREAKER_ACTION_IGNORE = "ignore"
 _BREAKER_ACTION_BUMP = "bump"
 _BREAKER_ACTION_RESET = "reset"
-_SAFE_NOTIFIER_EXCEPTION_TYPES = frozenset(
-    {
-        "ConnectionError",
-        "ImportError",
-        "OSError",
-        "RuntimeError",
-        "TimeoutError",
-    }
-)
 _ANNOTATION_HINTS = (
     "readOnlyHint",
     "destructiveHint",
@@ -80,7 +72,12 @@ logger = logging.getLogger(__name__)
 
 def _safe_notifier_exception_type(exc: Exception) -> str:
     name = type(exc).__name__
-    if name in _SAFE_NOTIFIER_EXCEPTION_TYPES:
+    builtin_type = getattr(builtins, name, None)
+    if (
+        isinstance(builtin_type, type)
+        and builtin_type is type(exc)
+        and issubclass(builtin_type, BaseException)
+    ):
         return name
     return "unrecognized_exception"
 

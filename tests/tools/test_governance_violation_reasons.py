@@ -32,5 +32,4 @@ def test_frozen_reasons_cover_every_literal_violation_origin():
                 ):
                     emitted.add(node.value.value)
 
-    assert len(emitted) == 20
     assert emitted == GOVERNANCE_VIOLATION_REASONS

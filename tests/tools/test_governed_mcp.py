@@ -3169,7 +3169,11 @@ def test_missing_fresh_approval_notifier_logs_registered_state(
 @pytest.mark.parametrize(
     ("exception_type", "expected_type"),
     [
+        (AttributeError, "AttributeError"),
+        (KeyError, "KeyError"),
         (RuntimeError, "RuntimeError"),
+        (TypeError, "TypeError"),
+        (ValueError, "ValueError"),
         (type("sk_live_abcdef", (RuntimeError,), {}), "unrecognized_exception"),
     ],
 )
