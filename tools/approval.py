@@ -199,6 +199,12 @@ def reset_current_observability_context(
     _approval_turn_id.reset(turn_token)
 
 
+def get_current_observability_context() -> tuple[str, str]:
+    """Return the host-bound turn and tool-call identifiers for this call."""
+
+    return _approval_turn_id.get(), _approval_tool_call_id.get()
+
+
 def get_current_session_key(default: str = "default") -> str:
     """Return the active session key, preferring context-local state.
 
@@ -2320,6 +2326,22 @@ def register_gateway_notify(session_key: str, cb) -> None:
     """
     with _lock:
         _gateway_notify_cbs[session_key] = cb
+
+
+def notify_fresh_approval(session_key: str, approval_data: dict) -> bool:
+    """Emit one fresh-only request without entering the legacy FIFO queue.
+
+    The caller owns exact-ID resolution through ``FreshApprovalCoordinator``.
+    Taking a callback snapshot under the shared lock preserves unregister
+    ordering while invoking transport code outside the lock.
+    """
+
+    with _lock:
+        notify_cb = _gateway_notify_cbs.get(session_key)
+    if notify_cb is None:
+        return False
+    notify_cb(dict(approval_data))
+    return True
 
 
 def unregister_gateway_notify(session_key: str) -> None:

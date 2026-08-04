@@ -5219,6 +5219,138 @@ class GatewaySlashCommandsMixin:
         lines.append("Invoke a bundle with `/<slug>` to load all its skills.")
         return "\n".join(lines)
 
+    def _resolve_fresh_telegram_approval(
+        self,
+        event: MessageEvent,
+        *,
+        decision: str,
+    ) -> Optional[str]:
+        """Resolve an exact fresh ID from an authorized Telegram command.
+
+        ``None`` means the command is not an exact fresh request and should
+        continue through the established legacy session/FIFO path.
+        """
+        raw_args = event.get_command_args().strip()
+        if not raw_args:
+            return None
+        first_token = raw_args.split(maxsplit=1)[0]
+        conclusively_fresh = first_token.startswith("fa_")
+        if any(char.isspace() for char in raw_args):
+            return "Approval rejected or expired." if conclusively_fresh else None
+
+        from tools.fresh_approval import (
+            ApprovalRejected,
+            ConversationBinding,
+            get_fresh_approval_coordinator,
+        )
+
+        coordinator = get_fresh_approval_coordinator()
+        try:
+            coordinator.get_request(raw_args)
+        except ApprovalRejected:
+            return "Approval rejected or expired." if conclusively_fresh else None
+
+        source = event.source
+        if source.platform != Platform.TELEGRAM:
+            key = "gateway.deny.no_pending" if decision == "deny" else "gateway.approve.no_pending"
+            return t(key)
+        if not self._is_user_authorized(source):
+            return "You are not authorized to resolve this approval."
+
+        session_key = self._session_key_for_source(source)
+        inbound_id = str(event.message_id or source.message_id or "")
+        trusted_issuer = getattr(
+            self,
+            "_issue_telegram_trusted_interaction",
+            None,
+        )
+        trusted_interaction = (
+            trusted_issuer(
+                event,
+                session_key,
+                surface="gateway_approval",
+                attach=False,
+            )
+            if callable(trusted_issuer)
+            else None
+        )
+        trusted_token = None
+        session_tokens = []
+        try:
+            if trusted_interaction is not None:
+                from agent._trusted_interaction_issuer import (
+                    _bind_trusted_interaction,
+                    _publish_trusted_interaction,
+                )
+                from gateway.session_context import set_session_vars
+
+                session_tokens = set_session_vars(
+                    platform="telegram",
+                    source=trusted_interaction.surface,
+                    chat_id=trusted_interaction.chat_id,
+                    thread_id=trusted_interaction.thread_id or "",
+                    user_id=trusted_interaction.actor_id,
+                    session_key=trusted_interaction.session_key,
+                    session_id=trusted_interaction.session_id,
+                    message_id=trusted_interaction.message_id,
+                    profile=trusted_interaction.profile_id,
+                )
+                _publish_trusted_interaction(trusted_interaction)
+                trusted_token = _bind_trusted_interaction(
+                    trusted_interaction
+                )
+            responder = coordinator._mint_authenticated_responder_for_host(
+                assurance="telegram_authenticated",
+                principal_id=str(source.user_id or ""),
+                binding=ConversationBinding(
+                    profile_id=str(source.profile or "default"),
+                    platform=source.platform.value,
+                    channel_id=str(source.scope_id or source.chat_id),
+                    chat_id=str(source.chat_id),
+                    session_key=session_key,
+                    session_id=(
+                        trusted_interaction.session_id
+                        if trusted_interaction is not None
+                        else session_key
+                    ),
+                    thread_id=(
+                        str(source.thread_id)
+                        if source.thread_id is not None
+                        else None
+                    ),
+                    actor_id=str(source.user_id or ""),
+                ),
+                inbound_id=inbound_id,
+            )
+            coordinator.resolve(
+                raw_args,
+                decision=decision,
+                responder=responder,
+            )
+        except ApprovalRejected as exc:
+            logger.warning("Fresh Telegram command approval rejected: %s", exc)
+            return "Approval rejected or expired."
+        finally:
+            if trusted_token is not None:
+                from agent._trusted_interaction_issuer import (
+                    _clear_trusted_interactions,
+                    _reset_trusted_interaction,
+                )
+
+                _reset_trusted_interaction(trusted_token)
+                _clear_trusted_interactions(interaction=trusted_interaction)
+            if session_tokens:
+                from gateway.session_context import clear_session_vars
+
+                clear_session_vars(session_tokens)
+
+        adapter = self.adapters.get(source.platform)
+        if adapter:
+            adapter.resume_typing_for_chat(source.chat_id)
+        if decision == "deny":
+            return t("gateway.deny.denied_singular")
+        return t("gateway.approve.once_singular", count=1)
+
     async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /approve command — unblock waiting agent thread(s).
 
@@ -5232,6 +5364,7 @@ class GatewaySlashCommandsMixin:
         ``/approve all`` resolves every pending command at once.
 
         Usage:
+            /approve <approval_id> — approve one exact fresh request
             /approve              — approve oldest pending command once
             /approve all          — approve ALL pending commands at once
             /approve session      — approve oldest + remember for session
@@ -5241,6 +5374,13 @@ class GatewaySlashCommandsMixin:
         """
         source = event.source
         session_key = self._session_key_for_source(source)
+
+        fresh_reply = self._resolve_fresh_telegram_approval(
+            event,
+            decision="approve_once",
+        )
+        if fresh_reply is not None:
+            return fresh_reply
 
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
@@ -5264,7 +5404,24 @@ class GatewaySlashCommandsMixin:
         else:
             choice = "once"
 
-        count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
+        from contextlib import nullcontext
+
+        response_context = getattr(
+            self,
+            "_trusted_telegram_response_context",
+            None,
+        )
+        scope = (
+            response_context(event, session_key)
+            if callable(response_context)
+            else nullcontext()
+        )
+        with scope:
+            count = resolve_gateway_approval(
+                session_key,
+                choice,
+                resolve_all=resolve_all,
+            )
         if not count:
             return t("gateway.approve.no_pending")
 
@@ -5284,12 +5441,20 @@ class GatewaySlashCommandsMixin:
         a definitive BLOCKED message, same as the CLI deny flow.
 
         ``/deny`` denies the oldest; ``/deny all`` denies everything.
+        ``/deny <approval_id>`` denies one exact fresh request.
         ``/deny <reason>`` (or ``/deny all <reason>``) attaches a one-line
         reason that is relayed back to the agent so it can adapt instead of
         only hearing "denied". Ported from qwibitai/nanoclaw#2832.
         """
         source = event.source
         session_key = self._session_key_for_source(source)
+
+        fresh_reply = self._resolve_fresh_telegram_approval(
+            event,
+            decision="deny",
+        )
+        if fresh_reply is not None:
+            return fresh_reply
 
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
@@ -5315,10 +5480,25 @@ class GatewaySlashCommandsMixin:
         if reason:
             reason = reason[:280].strip()
 
-        count = resolve_gateway_approval(
-            session_key, "deny", resolve_all=resolve_all,
-            reason=reason or None,
+        from contextlib import nullcontext
+
+        response_context = getattr(
+            self,
+            "_trusted_telegram_response_context",
+            None,
         )
+        scope = (
+            response_context(event, session_key)
+            if callable(response_context)
+            else nullcontext()
+        )
+        with scope:
+            count = resolve_gateway_approval(
+                session_key,
+                "deny",
+                resolve_all=resolve_all,
+                reason=reason or None,
+            )
         if not count:
             return t("gateway.deny.no_pending")
 

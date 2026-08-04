@@ -30,6 +30,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, MutableMapping, Optional
@@ -43,6 +44,7 @@ from agent.secret_sources.base import (
     reset_source_environment,
     set_source_environment,
 )
+from registry_transaction import MappingRegistry, RegistryTransactionConflict
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,131 @@ logger = logging.getLogger(__name__)
 # insertion order, which doubles as the default apply order.
 _SOURCES: Dict[str, SecretSource] = {}
 _BUILTINS_LOADED = False
+_lock = threading.RLock()
+_registry_state = MappingRegistry("secret", _SOURCES, _lock)
+_BUILTINS_LOADING = False
+_BUILTINS_LOADING_THREAD: Optional[int] = None
+_BUILTINS_READY = threading.Event()
+
+
+class _SecretSnapshot:
+    __slots__ = ("_owner", "_mapping", "_builtins_loaded")
+
+    def __init__(self, owner, mapping, builtins_loaded: bool) -> None:
+        self._owner = owner
+        self._mapping = mapping
+        self._builtins_loaded = builtins_loaded
+
+
+class _SecretView:
+    __slots__ = ("_owner", "_snapshot", "registry", "builtins_loaded")
+
+    def __init__(self, owner, snapshot, registry, builtins_loaded: bool) -> None:
+        self._owner = owner
+        self._snapshot = snapshot
+        self.registry = registry
+        self.builtins_loaded = builtins_loaded
+
+
+class _PreparedSecretState:
+    __slots__ = ("_owner", "_snapshot", "_mapping", "_builtins_loaded")
+
+    def __init__(self, owner, snapshot, mapping, builtins_loaded: bool) -> None:
+        self._owner = owner
+        self._snapshot = snapshot
+        self._mapping = mapping
+        self._builtins_loaded = builtins_loaded
+
+
+class _SecretTransactionSurface:
+    surface = "secret"
+
+    @property
+    def lock(self):
+        return _registry_state.lock
+
+    def take_snapshot(self):
+        with _registry_state.lock:
+            return _SecretSnapshot(
+                self,
+                _registry_state.take_snapshot(),
+                _BUILTINS_LOADED,
+            )
+
+    def _validate_snapshot(self, snapshot) -> None:
+        if not isinstance(snapshot, _SecretSnapshot) or snapshot._owner is not self:
+            raise ValueError(
+                "transaction snapshot belongs to a different secret registry"
+            )
+
+    def create_view(self, snapshot, *, remove_keys=()):
+        self._validate_snapshot(snapshot)
+        return _SecretView(
+            self,
+            snapshot,
+            _registry_state.create_view(
+                snapshot._mapping,
+                remove_keys=remove_keys,
+            ),
+            snapshot._builtins_loaded,
+        )
+
+    def register(self, staged, source) -> Optional[str]:
+        if not isinstance(staged, _SecretView) or staged._owner is not self:
+            raise ValueError("transaction view belongs to a different secret registry")
+        return _register_source_in(staged.registry, source)
+
+    def prepare(self, snapshot, staged):
+        self._validate_snapshot(snapshot)
+        if (
+            not isinstance(staged, _SecretView)
+            or staged._owner is not self
+            or staged._snapshot is not snapshot
+        ):
+            raise ValueError("transaction view belongs to a different secret registry")
+        return _PreparedSecretState(
+            self,
+            snapshot,
+            _registry_state.prepare(snapshot._mapping, staged.registry),
+            staged.builtins_loaded,
+        )
+
+    def validate_prepared_locked(self, snapshot, prepared) -> None:
+        self._validate_snapshot(snapshot)
+        if (
+            not isinstance(prepared, _PreparedSecretState)
+            or prepared._owner is not self
+            or prepared._snapshot is not snapshot
+        ):
+            raise ValueError("prepared state belongs to a different secret registry")
+        if _BUILTINS_LOADED != snapshot._builtins_loaded:
+            raise RegistryTransactionConflict(
+                self.surface,
+                snapshot._mapping._generation,
+                _registry_state._generation,
+            )
+        _registry_state.validate_prepared_locked(
+            snapshot._mapping,
+            prepared._mapping,
+        )
+
+    def install_prepared_locked(self, snapshot, prepared) -> None:
+        global _BUILTINS_LOADED
+        self.validate_prepared_locked(snapshot, prepared)
+        _registry_state.install_prepared_locked(
+            snapshot._mapping,
+            prepared._mapping,
+        )
+        _BUILTINS_LOADED = prepared._builtins_loaded
+
+    def restore_snapshot_locked(self, snapshot) -> None:
+        global _BUILTINS_LOADED
+        self._validate_snapshot(snapshot)
+        _registry_state.restore_snapshot_locked(snapshot._mapping)
+        _BUILTINS_LOADED = snapshot._builtins_loaded
+
+
+_plugin_transaction = _SecretTransactionSurface()
 
 
 @dataclass
@@ -94,8 +221,13 @@ class ApplyReport:
 # ---------------------------------------------------------------------------
 
 
-def register_source(source: SecretSource, *, replace: bool = False) -> bool:
-    """Register a secret source.  Returns True on success.
+def _register_source_in(
+    target: MappingRegistry,
+    source: SecretSource,
+    *,
+    replace: bool = False,
+) -> Optional[str]:
+    """Validate and register into a live registry or isolated transaction view.
 
     Rejections are logged, never raised — a bad plugin must not take
     down startup.  ``replace`` allows tests / user plugins to override
@@ -108,88 +240,145 @@ def register_source(source: SecretSource, *, replace: bool = False) -> bool:
             "Ignoring secret source %r: does not inherit from SecretSource",
             source,
         )
-        return False
+        return None
     name = getattr(source, "name", "") or ""
     if not name or not name.replace("_", "").isalnum() or name != name.lower():
         logger.warning("Ignoring secret source with invalid name %r", name)
-        return False
+        return None
     if getattr(source, "api_version", None) != SECRET_SOURCE_API_VERSION:
         logger.warning(
             "Ignoring secret source '%s': built against secret-source API v%s, "
             "this Hermes speaks v%s",
             name, getattr(source, "api_version", "?"), SECRET_SOURCE_API_VERSION,
         )
-        return False
+        return None
     if getattr(source, "shape", None) not in ("mapped", "bulk"):
         logger.warning(
             "Ignoring secret source '%s': shape must be 'mapped' or 'bulk', got %r",
             name, getattr(source, "shape", None),
         )
-        return False
-    if name in _SOURCES and not replace:
-        logger.warning("Secret source '%s' already registered; ignoring duplicate", name)
-        return False
+        return None
     scheme = getattr(source, "scheme", None)
-    if scheme:
-        for other_name, other in _SOURCES.items():
-            if other_name != name and getattr(other, "scheme", None) == scheme:
+    while True:
+        snapshot = target.take_snapshot()
+        items = target.snapshot_items(snapshot)
+        if not replace and any(other_name == name for other_name, _other in items):
+            logger.warning("Secret source '%s' already registered; ignoring duplicate", name)
+            return None
+        if scheme:
+            collision = next(
+                (
+                    other_name
+                    for other_name, other in items
+                    if other_name != name
+                    and getattr(other, "scheme", None) == scheme
+                ),
+                None,
+            )
+            if collision is not None:
                 logger.warning(
                     "Ignoring secret source '%s': scheme '%s://' is already "
                     "owned by source '%s'",
-                    name, scheme, other_name,
+                    name, scheme, collision,
                 )
-                return False
-    _SOURCES[name] = source
-    return True
+                return None
+        try:
+            added, _existing = target.put_if_snapshot(
+                snapshot,
+                name,
+                source,
+                replace=replace,
+            )
+        except RegistryTransactionConflict:
+            continue
+        return name if added else None
+
+
+def register_source(source: SecretSource, *, replace: bool = False) -> bool:
+    """Register a secret source.  Returns True on success."""
+    return _register_source_in(
+        _registry_state,
+        source,
+        replace=replace,
+    ) is not None
 
 
 def get_source(name: str) -> Optional[SecretSource]:
     _ensure_builtin_sources()
-    return _SOURCES.get(name)
+    return _registry_state.get(name)
 
 
 def list_sources() -> List[SecretSource]:
     _ensure_builtin_sources()
-    return list(_SOURCES.values())
+    return _registry_state.values()
 
 
 def _ensure_builtin_sources() -> None:
-    """Idempotently register the bundled sources.
-
-    Lazy so importing this module stays cheap and so a broken bundled
-    source can never break registration of the others.
-    """
-    global _BUILTINS_LOADED
-    if _BUILTINS_LOADED:
+    """Resolve bundled sources once without imports or constructors under lock."""
+    global _BUILTINS_LOADED, _BUILTINS_LOADING, _BUILTINS_LOADING_THREAD
+    with _lock:
+        if _BUILTINS_LOADED:
+            return
+        if _BUILTINS_LOADING:
+            if _BUILTINS_LOADING_THREAD == threading.get_ident():
+                return
+            ready = _BUILTINS_READY
+            should_load = False
+        else:
+            _BUILTINS_LOADING = True
+            _BUILTINS_LOADING_THREAD = threading.get_ident()
+            _BUILTINS_READY.clear()
+            ready = _BUILTINS_READY
+            should_load = True
+    if not should_load:
+        ready.wait()
         return
-    _BUILTINS_LOADED = True
-    try:
-        from agent.secret_sources.bitwarden import BitwardenSource
 
-        register_source(BitwardenSource())
-    except Exception:  # noqa: BLE001 — never block startup
-        logger.warning("Failed to register bundled Bitwarden secret source",
-                       exc_info=True)
     try:
-        from agent.secret_sources.onepassword import OnePasswordSource
+        try:
+            from agent.secret_sources.bitwarden import BitwardenSource
 
-        register_source(OnePasswordSource())
-    except Exception:  # noqa: BLE001 — never block startup
-        logger.warning("Failed to register bundled 1Password secret source",
-                       exc_info=True)
-    try:
-        from agent.secret_sources.command import CommandSource
+            register_source(BitwardenSource())
+        except Exception:
+            logger.warning(
+                "Failed to register bundled Bitwarden secret source",
+                exc_info=True,
+            )
+        try:
+            from agent.secret_sources.onepassword import OnePasswordSource
 
-        register_source(CommandSource())
-    except Exception:  # noqa: BLE001 — never block startup
-        logger.warning("Failed to register bundled command secret source",
-                       exc_info=True)
+            register_source(OnePasswordSource())
+        except Exception:
+            logger.warning(
+                "Failed to register bundled 1Password secret source",
+                exc_info=True,
+            )
+        try:
+            from agent.secret_sources.command import CommandSource
+
+            register_source(CommandSource())
+        except Exception:
+            logger.warning(
+                "Failed to register bundled command secret source",
+                exc_info=True,
+            )
+    finally:
+        with _lock:
+            _BUILTINS_LOADED = True
+            _BUILTINS_LOADING = False
+            _BUILTINS_LOADING_THREAD = None
+            _registry_state._generation += 1
+            ready.set()
 
 
 def _reset_registry_for_tests() -> None:
-    global _BUILTINS_LOADED
-    _SOURCES.clear()
-    _BUILTINS_LOADED = False
+    global _BUILTINS_LOADED, _BUILTINS_LOADING, _BUILTINS_LOADING_THREAD
+    _registry_state.clear()
+    with _lock:
+        _BUILTINS_LOADED = False
+        _BUILTINS_LOADING = False
+        _BUILTINS_LOADING_THREAD = None
+        _BUILTINS_READY.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -261,27 +450,28 @@ def _ordered_enabled_sources(secrets_cfg: dict) -> List[SecretSource]:
     precedence is applied on top of this order by :func:`apply_all`.
     """
     _ensure_builtin_sources()
+    sources = dict(_registry_state.items_snapshot())
 
     explicit = secrets_cfg.get("sources")
     order: List[str] = []
     if isinstance(explicit, list):
         for entry in explicit:
-            if isinstance(entry, str) and entry in _SOURCES and entry not in order:
+            if isinstance(entry, str) and entry in sources and entry not in order:
                 order.append(entry)
         unknown = [e for e in explicit
-                   if isinstance(e, str) and e not in _SOURCES]
+                   if isinstance(e, str) and e not in sources]
         if unknown:
             logger.warning(
                 "secrets.sources names unknown source(s): %s (known: %s)",
-                ", ".join(unknown), ", ".join(_SOURCES) or "none",
+                ", ".join(unknown), ", ".join(sources) or "none",
             )
-    for name in _SOURCES:
+    for name in sources:
         if name not in order:
             order.append(name)
 
     enabled: List[SecretSource] = []
     for name in order:
-        source = _SOURCES[name]
+        source = sources[name]
         cfg = secrets_cfg.get(name)
         cfg = cfg if isinstance(cfg, dict) else {}
         try:

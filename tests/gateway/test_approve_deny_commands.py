@@ -66,6 +66,28 @@ def _make_runner():
     return runner
 
 
+def _make_slash_runner():
+    """Build only the slash-command mixin (avoids unrelated gateway imports)."""
+    from gateway.session import build_session_key
+    from gateway.slash_commands import GatewaySlashCommandsMixin
+
+    runner = object.__new__(GatewaySlashCommandsMixin)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+    )
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._pending_approvals = {}
+    runner._is_user_authorized = lambda _source: True
+    runner._session_key_for_source = lambda source: build_session_key(
+        source,
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+    )
+    return runner
+
+
 def _clear_approval_state():
     """Reset all module-level approval state between tests."""
     from tools import approval as mod
@@ -204,6 +226,84 @@ class TestApproveCommand:
         assert e1.result == "session"
         assert e2.result == "session"
 
+    @pytest.mark.asyncio
+    async def test_telegram_explicit_fresh_id_derives_responder_from_event(
+        self, monkeypatch
+    ):
+        from tools import fresh_approval
+
+        runner = _make_slash_runner()
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+        coordinator = fresh_approval.FreshApprovalCoordinator()
+        monkeypatch.setattr(fresh_approval, "_DEFAULT_COORDINATOR", coordinator)
+        binding = fresh_approval.ConversationBinding(
+            profile_id="default",
+            platform="telegram",
+            channel_id=source.chat_id,
+            chat_id=source.chat_id,
+            session_key=session_key,
+            session_id=session_key,
+            thread_id=source.thread_id,
+            actor_id=source.user_id,
+        )
+        subject = fresh_approval.InvocationSubject(
+            invocation_id="invocation-command-1",
+            tool_call_id="tool-call-command-1",
+            turn_id="turn-command-1",
+            origin_message_id="origin-command-1",
+            args_hash="args-command-1",
+            proposal_hash="proposal-command-1",
+            conversation=binding,
+        )
+        request = coordinator.request(subject, ttl_seconds=30)
+        event = _make_event(f"/approve {request.approval_id}")
+        event.message_id = "approval-command-message-1"
+
+        result = await runner._handle_approve_command(event)
+
+        resolution = coordinator.await_resolution(request.approval_id, timeout=0)
+        assert resolution.outcome == "approved"
+        assert resolution.evidence.responder.inbound_id == event.message_id
+        assert resolution.evidence.responder.binding == binding
+        assert "approved" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_fresh_id_from_non_telegram_adapter_stays_unresolved(self, monkeypatch):
+        from tools import fresh_approval
+
+        runner = _make_slash_runner()
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+        coordinator = fresh_approval.FreshApprovalCoordinator()
+        monkeypatch.setattr(fresh_approval, "_DEFAULT_COORDINATOR", coordinator)
+        binding = fresh_approval.ConversationBinding(
+            profile_id="default",
+            platform="telegram",
+            channel_id=source.chat_id,
+            chat_id=source.chat_id,
+            session_key=session_key,
+            session_id=session_key,
+            thread_id=None,
+            actor_id=source.user_id,
+        )
+        subject = fresh_approval.InvocationSubject(
+            invocation_id="invocation-command-2",
+            tool_call_id="tool-call-command-2",
+            turn_id="turn-command-2",
+            origin_message_id="origin-command-2",
+            args_hash="args-command-2",
+            proposal_hash="proposal-command-2",
+            conversation=binding,
+        )
+        request = coordinator.request(subject, ttl_seconds=30)
+        event = _make_event(f"/approve {request.approval_id}")
+        event.source.platform = Platform.DISCORD
+
+        await runner._handle_approve_command(event)
+
+        assert coordinator.await_resolution(request.approval_id, timeout=0) is None
+
 
 # ------------------------------------------------------------------
 # /deny command
@@ -254,6 +354,180 @@ class TestDenyCommand:
         assert "2 commands" in result
         assert all(e.result == "deny" for e in [e1, e2])
         assert all(e.reason == "wrong directory" for e in [e1, e2])
+
+    @pytest.mark.asyncio
+    async def test_telegram_explicit_fresh_id_can_deny(self, monkeypatch):
+        from tools import fresh_approval
+
+        runner = _make_slash_runner()
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+        coordinator = fresh_approval.FreshApprovalCoordinator()
+        monkeypatch.setattr(fresh_approval, "_DEFAULT_COORDINATOR", coordinator)
+        binding = fresh_approval.ConversationBinding(
+            profile_id="default",
+            platform="telegram",
+            channel_id=source.chat_id,
+            chat_id=source.chat_id,
+            session_key=session_key,
+            session_id=session_key,
+            thread_id=None,
+            actor_id=source.user_id,
+        )
+        subject = fresh_approval.InvocationSubject(
+            invocation_id="invocation-deny-1",
+            tool_call_id="tool-call-deny-1",
+            turn_id="turn-deny-1",
+            origin_message_id="origin-deny-1",
+            args_hash="args-deny-1",
+            proposal_hash="proposal-deny-1",
+            conversation=binding,
+        )
+        request = coordinator.request(subject, ttl_seconds=30)
+        event = _make_event(f"/deny {request.approval_id}")
+        event.message_id = "deny-command-message-1"
+
+        result = await runner._handle_deny_command(event)
+
+        resolution = coordinator.await_resolution(request.approval_id, timeout=0)
+        assert resolution.outcome == "denied"
+        assert "denied" in result.lower()
+
+
+class TestFreshApprovalNamespace:
+
+    def setup_method(self):
+        _clear_approval_state()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("command", "handler_name"),
+        [
+            ("/approve fa_unknown-or-expired", "_handle_approve_command"),
+            ("/deny fa_unknown-or-expired", "_handle_deny_command"),
+            ("/approve fa_malformed extra-token", "_handle_approve_command"),
+            ("/deny fa_malformed extra-token", "_handle_deny_command"),
+        ],
+    )
+    async def test_unknown_fresh_id_never_falls_back_to_legacy_fifo(
+        self, command, handler_name
+    ):
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_slash_runner()
+        session_key = runner._session_key_for_source(_make_source())
+        legacy = _ApprovalEntry({"command": "legacy command"})
+        _gateway_queues[session_key] = [legacy]
+
+        result = await getattr(runner, handler_name)(_make_event(command))
+
+        assert "rejected" in result.lower() or "expired" in result.lower()
+        assert _gateway_queues[session_key] == [legacy]
+        assert legacy.result is None
+        assert legacy.reason is None
+        assert not legacy.event.is_set()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("command_name", "handler_name"),
+        [
+            ("approve", "_handle_approve_command"),
+            ("deny", "_handle_deny_command"),
+        ],
+    )
+    async def test_expired_fresh_id_never_falls_back_to_legacy_fifo(
+        self, monkeypatch, command_name, handler_name
+    ):
+        from tools import fresh_approval
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_slash_runner()
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+        now = [100.0]
+        coordinator = fresh_approval.FreshApprovalCoordinator(
+            clock=lambda: now[0], replay_ttl=10
+        )
+        monkeypatch.setattr(fresh_approval, "_DEFAULT_COORDINATOR", coordinator)
+        binding = fresh_approval.ConversationBinding(
+            profile_id="default",
+            platform="telegram",
+            channel_id=source.chat_id,
+            chat_id=source.chat_id,
+            session_key=session_key,
+            session_id=session_key,
+            thread_id=None,
+            actor_id=source.user_id,
+        )
+        subject = fresh_approval.InvocationSubject(
+            invocation_id="invocation-expired-text",
+            tool_call_id="tool-call-expired-text",
+            turn_id="turn-expired-text",
+            origin_message_id="origin-expired-text",
+            args_hash="args-expired-text",
+            proposal_hash="proposal-expired-text",
+            conversation=binding,
+        )
+        request = coordinator.request(subject, ttl_seconds=1)
+        legacy = _ApprovalEntry({"command": "legacy command"})
+        _gateway_queues[session_key] = [legacy]
+        now[0] = 102.0
+
+        result = await getattr(runner, handler_name)(
+            _make_event(f"/{command_name} {request.approval_id}")
+        )
+
+        assert "rejected" in result.lower() or "expired" in result.lower()
+        assert _gateway_queues[session_key] == [legacy]
+        assert not legacy.event.is_set()
+        assert coordinator.await_resolution(request.approval_id, timeout=0).outcome == (
+            "expired"
+        )
+
+    @pytest.mark.asyncio
+    async def test_exact_fresh_text_id_resolves_only_that_request(self, monkeypatch):
+        from tools import fresh_approval
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_slash_runner()
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+        coordinator = fresh_approval.FreshApprovalCoordinator()
+        monkeypatch.setattr(fresh_approval, "_DEFAULT_COORDINATOR", coordinator)
+        binding = fresh_approval.ConversationBinding(
+            profile_id="default",
+            platform="telegram",
+            channel_id=source.chat_id,
+            chat_id=source.chat_id,
+            thread_id=None,
+            session_key=session_key,
+            session_id=session_key,
+            actor_id=source.user_id,
+        )
+        subject = fresh_approval.InvocationSubject(
+            invocation_id="invocation-exact-text",
+            tool_call_id="tool-call-exact-text",
+            turn_id="turn-exact-text",
+            origin_message_id="origin-exact-text",
+            args_hash="args-exact-text",
+            proposal_hash="proposal-exact-text",
+            conversation=binding,
+        )
+        request = coordinator.request(subject, ttl_seconds=30)
+        legacy = _ApprovalEntry({"command": "legacy command"})
+        _gateway_queues[session_key] = [legacy]
+
+        result = await runner._handle_approve_command(
+            _make_event(f"/approve {request.approval_id}")
+        )
+
+        assert request.approval_id.startswith("fa_")
+        assert coordinator.await_resolution(request.approval_id, timeout=0).outcome == (
+            "approved"
+        )
+        assert _gateway_queues[session_key] == [legacy]
+        assert not legacy.event.is_set()
+        assert "approved" in result.lower()
 
 
 # ------------------------------------------------------------------

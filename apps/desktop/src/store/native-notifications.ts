@@ -4,7 +4,7 @@ import { persistString, storedString } from '@/lib/storage'
 
 import { $gateway } from './gateway'
 import { withinNativeNotifyBaseline } from './notify-baseline'
-import { clearApprovalRequest } from './prompts'
+import { approvalRespondParams, clearApprovalRequest, sessionApprovalRequest } from './prompts'
 import { $activeSessionId } from './session'
 
 // Native OS notifications (Electron `Notification`), separate from the in-app
@@ -199,7 +199,11 @@ export async function respondToApprovalAction(sessionId: null | string, actionId
   }
 
   try {
-    await gateway.request('approval.respond', { choice, session_id: sessionId ?? undefined })
+    const pending = sessionApprovalRequest(sessionId).get()
+    const params = pending
+      ? approvalRespondParams(pending, choice)
+      : { choice, session_id: sessionId ?? undefined }
+    await gateway.request('approval.respond', params)
     clearApprovalRequest(sessionId)
   } catch {
     // Leave the prompt parked so the user can still resolve it in-app.

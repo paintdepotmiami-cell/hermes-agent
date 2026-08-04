@@ -498,21 +498,36 @@ def _format_exec_approval_fallback(
     allow_permanent: bool = True,
     allow_session: bool = True,
     smart_denied: bool = False,
+    approval_id: Optional[str] = None,
 ) -> str:
     """Render the text fallback from approval capabilities, not platform names."""
-    cmd_preview = command[:200] + "..." if len(command) > 200 else command
+    # A fresh approval is bound to this exact preview, so dropping its tail
+    # would ask the user to consent to text they were not shown. Legacy exec
+    # approvals retain their established compact presentation.
+    cmd_preview = (
+        command
+        if approval_id
+        else (command[:200] + "..." if len(command) > 200 else command)
+    )
     heading = "⚠️ **Dangerous command requires approval:**"
     if smart_denied:
         heading = "⚠️ **Smart DENY — owner override for one operation:**"
 
-    choices = [f"Reply `{command_prefix}approve` to execute this one operation"]
-    if not smart_denied and allow_session:
+    if approval_id:
+        choices = [
+            f"Reply `{command_prefix}approve {approval_id}` to execute this one operation",
+            f"`{command_prefix}deny {approval_id}` to cancel",
+        ]
+    else:
+        choices = [f"Reply `{command_prefix}approve` to execute this one operation"]
+    if not approval_id and not smart_denied and allow_session:
         choices.append(
             f"`{command_prefix}approve session` to approve this pattern for the session"
         )
         if allow_permanent:
             choices.append(f"`{command_prefix}approve always` to approve permanently")
-    choices.append(f"`{command_prefix}deny` to cancel")
+    if not approval_id:
+        choices.append(f"`{command_prefix}deny` to cancel")
     return (
         f"{heading}\n```\n{cmd_preview}\n```\nReason: {description}\n\n"
         + ", ".join(choices[:-1]) + f", or {choices[-1]}."
@@ -5061,17 +5076,20 @@ class TurnRunner:
             # false positives from MagicMock auto-attribute creation in tests.
             if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
                 try:
+                    _approval_send_kwargs = {
+                        "chat_id": ctx._status_chat_id,
+                        "command": cmd,
+                        "session_key": _approval_session_key,
+                        "description": desc,
+                        "metadata": ctx._status_thread_metadata,
+                        "allow_permanent": approval_data.get("allow_permanent", True),
+                        "allow_session": approval_data.get("allow_session", True),
+                        "smart_denied": approval_data.get("smart_denied", False),
+                    }
+                    if approval_data.get("approval_id"):
+                        _approval_send_kwargs["approval_id"] = approval_data["approval_id"]
                     _approval_fut = safe_schedule_threadsafe(
-                        ctx._status_adapter.send_exec_approval(
-                            chat_id=ctx._status_chat_id,
-                            command=cmd,
-                            session_key=_approval_session_key,
-                            description=desc,
-                            metadata=ctx._status_thread_metadata,
-                            allow_permanent=approval_data.get("allow_permanent", True),
-                            allow_session=approval_data.get("allow_session", True),
-                            smart_denied=approval_data.get("smart_denied", False),
-                        ),
+                        ctx._status_adapter.send_exec_approval(**_approval_send_kwargs),
                         ctx._loop_for_step,
                         logger=logger,
                         log_message="send_exec_approval scheduling error",
@@ -5102,6 +5120,7 @@ class TurnRunner:
                 allow_permanent=approval_data.get("allow_permanent", True),
                 allow_session=approval_data.get("allow_session", True),
                 smart_denied=approval_data.get("smart_denied", False),
+                approval_id=approval_data.get("approval_id"),
             )
             try:
                 _approval_send_fut = safe_schedule_threadsafe(
@@ -8646,6 +8665,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled():
+                self._publish_accepted_telegram_interaction(event, session_key)
                 self._queue_or_replace_pending_event(session_key, event)
                 message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
             else:
@@ -8758,6 +8778,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # cascade after the current turn finishes.
         if getattr(event, "internal", False):
             return False
+
+        # Authentication and acceptance have both completed. Publish before
+        # steer/redirect/interrupt/queue so a tool already running under the
+        # original ContextVar snapshot resolves this session's newest accepted
+        # Telegram interaction from the host ledger.
+        self._publish_accepted_telegram_interaction(event, session_key)
 
         _busy_state = self._peek_session_state(session_key)
         running_agent = _busy_state.turn.agent if _busy_state else None
@@ -12240,6 +12266,186 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return "default"
 
+    def _issue_telegram_trusted_interaction(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        session_id: str | None = None,
+        surface: str = "gateway",
+        attach: bool = True,
+    ):
+        """Authenticate Telegram provenance from the normalized host event.
+
+        Identity never comes from message text, metadata, or model/tool args.
+        When the native Telegram object is available, its actor/chat/thread/
+        message identifiers must agree with the adapter-normalized source.
+        """
+        source = getattr(event, "source", None)
+        if (
+            source is None
+            or getattr(source, "platform", None) != Platform.TELEGRAM
+            or getattr(event, "internal", False)
+        ):
+            return None
+
+        from agent.trusted_interaction import TrustedInteraction
+
+        existing = getattr(event, "_trusted_interaction", None)
+        if (
+            isinstance(existing, TrustedInteraction)
+            and existing.surface == surface
+        ):
+            return existing
+
+        actor_id = str(getattr(source, "user_id", None) or "").strip()
+        chat_id = str(getattr(source, "chat_id", None) or "").strip()
+        thread_value = getattr(source, "thread_id", None)
+        thread_id = str(thread_value) if thread_value not in (None, "") else None
+        message_id = str(getattr(event, "message_id", None) or "").strip()
+        source_message_id = str(
+            getattr(source, "message_id", None) or ""
+        ).strip()
+        if source_message_id and source_message_id != message_id:
+            logger.warning(
+                "Refusing Telegram provenance with source/event message mismatch"
+            )
+            return None
+
+        raw = getattr(event, "raw_message", None)
+        if raw is not None:
+            raw_actor = getattr(getattr(raw, "from_user", None), "id", None)
+            raw_chat = getattr(getattr(raw, "chat", None), "id", None)
+            raw_message_id = getattr(raw, "message_id", None)
+            raw_thread = getattr(raw, "message_thread_id", None)
+            if raw_actor is not None and str(raw_actor) != actor_id:
+                return None
+            if raw_chat is not None and str(raw_chat) != chat_id:
+                return None
+            if raw_message_id is not None and str(raw_message_id) != message_id:
+                return None
+            normalized_raw_thread = (
+                str(raw_thread) if raw_thread not in (None, "") else None
+            )
+            if raw_thread is not None and normalized_raw_thread != thread_id:
+                return None
+
+        resolved_session_id = str(session_id or "").strip()
+        if not resolved_session_id:
+            try:
+                resolved_session_id = str(
+                    self.session_store.peek_session_id(session_key) or ""
+                ).strip()
+            except Exception:
+                resolved_session_id = ""
+        if not all(
+            (actor_id, chat_id, message_id, session_key, resolved_session_id)
+        ):
+            return None
+
+        received_at = time.time()
+        timestamp = getattr(event, "timestamp", None)
+        if timestamp is not None and hasattr(timestamp, "timestamp"):
+            try:
+                candidate = float(timestamp.timestamp())
+                if candidate == candidate and abs(candidate) != float("inf"):
+                    received_at = candidate
+            except (OSError, OverflowError, TypeError, ValueError):
+                pass
+
+        from agent._trusted_interaction_issuer import (
+            _issue_trusted_interaction,
+        )
+
+        interaction = _issue_trusted_interaction(
+            surface=surface,
+            platform="telegram",
+            actor_id=actor_id,
+            channel_id=str(getattr(source, "scope_id", None) or chat_id),
+            chat_id=chat_id,
+            thread_id=thread_id,
+            session_key=str(session_key),
+            session_id=resolved_session_id,
+            message_id=message_id,
+            received_at=received_at,
+            profile_id=str(
+                getattr(source, "profile", None) or self._active_profile_name()
+            ),
+        )
+        # Host-private attribute survives adapter queueing without exposing an
+        # issuer API or accepting identity from mutable text/args.
+        if attach:
+            event._trusted_interaction = interaction
+        return interaction
+
+    def _publish_accepted_telegram_interaction(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ):
+        interaction = self._issue_telegram_trusted_interaction(
+            event,
+            session_key,
+        )
+        if interaction is None:
+            return None
+        from agent._trusted_interaction_issuer import (
+            _publish_trusted_interaction,
+        )
+
+        _publish_trusted_interaction(interaction)
+        return interaction
+
+    @_contextmanager
+    def _trusted_telegram_response_context(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ):
+        """Bind a distinct, short-lived Telegram response interaction.
+
+        Approval replies authenticate the responder route; they are never the
+        original action interaction. A separate surface keeps this evidence
+        from replacing a live turn's latest accepted prompt in the ledger.
+        """
+        interaction = self._issue_telegram_trusted_interaction(
+            event,
+            session_key,
+            surface="gateway_approval",
+            attach=False,
+        )
+        if interaction is None:
+            yield None
+            return
+
+        from agent._trusted_interaction_issuer import (
+            _bind_trusted_interaction,
+            _clear_trusted_interactions,
+            _publish_trusted_interaction,
+            _reset_trusted_interaction,
+        )
+        from gateway.session_context import clear_session_vars, set_session_vars
+
+        session_tokens = set_session_vars(
+            platform="telegram",
+            source=interaction.surface,
+            chat_id=interaction.chat_id,
+            thread_id=interaction.thread_id or "",
+            user_id=interaction.actor_id,
+            session_key=interaction.session_key,
+            session_id=interaction.session_id,
+            message_id=interaction.message_id,
+            profile=interaction.profile_id,
+        )
+        _publish_trusted_interaction(interaction)
+        token = _bind_trusted_interaction(interaction)
+        try:
+            yield interaction
+        finally:
+            _reset_trusted_interaction(token)
+            _clear_trusted_interactions(interaction=interaction)
+            clear_session_vars(session_tokens)
+
     # ── Kanban board watchers ───────────────────────────────────────────
     # The kanban notifier/dispatcher watcher loops + their helpers live in
     # GatewayKanbanWatchersMixin (gateway/kanban_watchers.py). They use only
@@ -13283,6 +13489,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
+        # Private host ownership seam used by transport-authenticated callbacks.
+        # The callback must not infer a multiplex profile from client payload.
+        adapter._hermes_profile_id = profile_name
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
@@ -14234,6 +14443,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reset_session_vars()
         except Exception:
             logger.debug("reset_session_vars failed at handler entry", exc_info=True)
+        try:
+            from agent._trusted_interaction_issuer import (
+                _drop_trusted_interaction_context,
+            )
+
+            _drop_trusted_interaction_context()
+        except Exception:
+            logger.debug(
+                "trusted interaction context reset failed at handler entry",
+                exc_info=True,
+            )
 
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
@@ -14668,6 +14888,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return await self._dispatch_busy_slash_command(
                     event, _cmd_def_inner, _quick_key, source,
                 )
+
+            # This fast path is also reachable directly in tests and internal
+            # dispatch, bypassing BasePlatformAdapter's busy callback. A
+            # draining rejection is not an accepted interaction.
+            if not self._draining or self._queue_during_drain_enabled():
+                self._publish_accepted_telegram_interaction(event, _quick_key)
 
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
@@ -16290,6 +16516,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
+        _trusted_interaction = self._issue_telegram_trusted_interaction(
+            event,
+            session_key,
+            session_id=session_entry.session_id,
+        )
+        _trusted_interaction_token = None
+        if _trusted_interaction is not None:
+            from agent._trusted_interaction_issuer import (
+                _bind_trusted_interaction,
+                _publish_trusted_interaction,
+            )
+
+            _publish_trusted_interaction(_trusted_interaction)
+            _trusted_interaction_token = _bind_trusted_interaction(
+                _trusted_interaction
+            )
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -18126,6 +18368,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Try again or use /reset to start a fresh session."
             )
         finally:
+            if _trusted_interaction_token is not None:
+                from agent._trusted_interaction_issuer import (
+                    _clear_trusted_interactions,
+                    _reset_trusted_interaction,
+                )
+
+                _reset_trusted_interaction(_trusted_interaction_token)
+                # End-of-turn is a hard provenance boundary, including for
+                # copied contexts that outlive this task. A queued event keeps
+                # its immutable interaction object and re-publishes it when
+                # its own turn begins, so clearing the full session here is
+                # both fail-closed and queue-safe.
+                _clear_trusted_interactions(session_key=session_key)
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 
@@ -21096,6 +21351,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
         return set_session_vars(
             platform=context.source.platform.value,
+            source="gateway",
             chat_id=context.source.chat_id,
             chat_type=(
                 str(context.source.chat_type) if context.source.chat_type else ""
@@ -21105,8 +21361,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
+            session_id=context.session_id,
             message_id=str(context.source.message_id) if context.source.message_id else "",
-            profile=getattr(context.source, "profile", "") or "",
+            profile=(
+                getattr(context.source, "profile", "")
+                or self._active_profile_name()
+            ),
             async_delivery=_async_delivery,
             cron_session="",
         )
@@ -22706,6 +22966,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             store = getattr(self, attr, None)
             if isinstance(store, dict):
                 store.pop(session_key, None)
+        try:
+            from agent._trusted_interaction_issuer import (
+                _clear_trusted_interactions,
+            )
+
+            _clear_trusted_interactions(session_key=session_key)
+        except Exception:
+            logger.debug(
+                "Failed to clear trusted interaction ledger for %s",
+                session_key,
+                exc_info=True,
+            )
         self._clear_session_boundary_security_state(session_key)
         logger.debug(
             "Cleared conversation scope for %s (%s)", session_key, reason

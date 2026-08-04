@@ -6,7 +6,15 @@ import threading
 from pathlib import Path
 from unittest.mock import patch
 
-from tools.registry import ToolRegistry, _module_registers_tools, discover_builtin_tools
+import pytest
+
+from tools.registry import (
+    ToolRegistry,
+    _check_fn_cache,
+    _check_fn_last_good,
+    _module_registers_tools,
+    discover_builtin_tools,
+)
 
 
 def _dummy_handler(args, **kwargs):
@@ -19,6 +27,39 @@ def _make_schema(name="test_tool"):
         "description": f"A {name}",
         "parameters": {"type": "object", "properties": {}},
     }
+
+
+class _ObservingRLock:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.held = False
+
+    def acquire(self, *args, **kwargs):
+        acquired = self._lock.acquire(*args, **kwargs)
+        if acquired:
+            self.held = True
+        return acquired
+
+    def release(self):
+        self.held = False
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+
+
+class _LockCheckingSchema(dict):
+    def __init__(self, lock: _ObservingRLock, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._observed_lock = lock
+
+    def get(self, key, default=None):
+        assert not self._observed_lock.held, "schema.get ran under tool registry lock"
+        return super().get(key, default)
 
 
 class TestRegisterAndDispatch:
@@ -84,6 +125,204 @@ class TestRegisterAndDispatch:
             and "mcp__foo_bar__search" in record.message
             for record in caplog.records
         )
+
+    def test_empty_description_schema_fallback_resolves_before_live_lock(self):
+        reg = ToolRegistry()
+        observing_lock = _ObservingRLock()
+        reg._lock = observing_lock
+        schema = _LockCheckingSchema(
+            observing_lock,
+            {
+                "name": "empty_desc",
+                "description": "schema fallback",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        )
+
+        reg.register(
+            name="empty_desc",
+            toolset="plugin",
+            schema=schema,
+            handler=_dummy_handler,
+            description="",
+        )
+
+        assert reg.get_entry("empty_desc").description == "schema fallback"
+
+    def test_override_handler_globals_resolves_before_live_lock(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="protected",
+            toolset="terminal",
+            schema=_make_schema("protected"),
+            handler=_dummy_handler,
+        )
+        reg.register_plugin_override_policy("hermes_plugins.allowed", True)
+        observing_lock = _ObservingRLock()
+        reg._lock = observing_lock
+
+        class _Handler:
+            @property
+            def __globals__(self):
+                assert not observing_lock.held, "handler.__globals__ ran under tool registry lock"
+                return {"__name__": "hermes_plugins.allowed"}
+
+            def __call__(self, args, **kwargs):
+                return "override"
+
+        reg.register(
+            name="protected",
+            toolset="plugin",
+            schema=_make_schema("protected"),
+            handler=_Handler(),
+            override=True,
+        )
+
+        assert reg.get_entry("protected").handler({}) == "override"
+
+
+class TestHostPrivateTransactions:
+    def test_staging_view_is_isolated_until_commit_and_invalidates_caches(self):
+        reg = ToolRegistry()
+
+        def original(args, **kwargs):
+            return "original"
+
+        def staged_handler(args, **kwargs):
+            return "staged"
+
+        def check():
+            return True
+
+        reg.register(
+            name="original",
+            toolset="original_set",
+            schema=_make_schema("original"),
+            handler=original,
+        )
+        snapshot = reg._take_transaction_snapshot()
+        staged = reg._create_transaction_view(snapshot)
+        staged.register(
+            name="staged",
+            toolset="staged_set",
+            schema=_make_schema("staged"),
+            handler=staged_handler,
+            check_fn=check,
+        )
+        staged_entry = staged.get_entry("staged")
+
+        assert staged_entry is not None
+        assert reg.get_entry("staged") is None
+        generation_before_commit = reg._generation
+        with patch.dict(_check_fn_cache, {check: (0.0, True)}, clear=True), patch.dict(
+            _check_fn_last_good, {check: 0.0}, clear=True
+        ):
+            reg._commit_transaction_view(snapshot, staged)
+            assert _check_fn_cache == {}
+            assert _check_fn_last_good == {}
+
+        assert reg.get_entry("staged") is staged_entry
+        assert reg.dispatch("staged", {}) == "staged"
+        assert reg._generation > generation_before_commit
+
+    def test_staging_view_and_snapshot_are_bound_to_the_source_registry(self):
+        first = ToolRegistry()
+        second = ToolRegistry()
+        snapshot = first._take_transaction_snapshot()
+        staged = first._create_transaction_view(snapshot)
+
+        with pytest.raises(ValueError, match="different ToolRegistry"):
+            second._create_transaction_view(snapshot)
+        with pytest.raises(ValueError, match="different ToolRegistry"):
+            second._commit_transaction_view(snapshot, staged)
+
+    def test_transaction_commit_preserves_a_conflicting_live_change(self):
+        reg = ToolRegistry()
+        snapshot = reg._take_transaction_snapshot()
+        staged = reg._create_transaction_view(snapshot)
+        staged.register(
+            name="provisional",
+            toolset="staged_set",
+            schema=_make_schema("provisional"),
+            handler=_dummy_handler,
+        )
+
+        def concurrent(args, **kwargs):
+            return "concurrent"
+
+        reg.register(
+            name="concurrent",
+            toolset="concurrent_set",
+            schema=_make_schema("concurrent"),
+            handler=concurrent,
+        )
+        concurrent_entry = reg.get_entry("concurrent")
+
+        with pytest.raises(RuntimeError, match="changed during plugin registration"):
+            reg._commit_transaction_view(snapshot, staged)
+
+        assert reg.get_entry("concurrent") is concurrent_entry
+        assert reg.get_entry("provisional") is None
+
+    def test_restore_covers_all_mutable_state_and_advances_generation(self):
+        reg = ToolRegistry()
+
+        def original(args, **kwargs):
+            return "original"
+
+        def check():
+            return True
+
+        reg.register(
+            name="original",
+            toolset="original_set",
+            schema=_make_schema("original"),
+            handler=original,
+            check_fn=check,
+        )
+        reg.register_toolset_alias("original_alias", "original_set")
+        reg.register_plugin_override_policy("hermes_plugins.original", True)
+        original_entry = reg.get_entry("original")
+        snapshot = reg._take_transaction_snapshot()
+
+        assert not any(
+            isinstance(getattr(snapshot, attr), dict)
+            for attr in getattr(snapshot, "__slots__", ())
+        ), "host-private snapshots must not expose mutable dictionaries"
+
+        reg.register(
+            name="temporary",
+            toolset="temporary_set",
+            schema=_make_schema("temporary"),
+            handler=_dummy_handler,
+            check_fn=check,
+        )
+        reg.register_toolset_alias("temporary_alias", "temporary_set")
+        reg.register_plugin_override_policy("hermes_plugins.temporary", False)
+        generation_before_restore = reg._generation
+        with patch.dict(_check_fn_cache, {check: (0.0, True)}, clear=True), patch.dict(
+            _check_fn_last_good, {check: 0.0}, clear=True
+        ):
+            reg._restore_transaction_snapshot(snapshot)
+            assert _check_fn_cache == {}
+            assert _check_fn_last_good == {}
+
+        assert reg.get_entry("original") is original_entry
+        assert reg.get_entry("temporary") is None
+        assert reg.get_registered_toolset_aliases() == {
+            "original_alias": "original_set"
+        }
+        assert reg._toolset_checks == {"original_set": check}
+        assert reg._plugin_override_policy == {"hermes_plugins.original": True}
+        assert reg._generation == generation_before_restore + 1
+
+    def test_snapshot_belongs_to_the_registry_that_created_it(self):
+        first = ToolRegistry()
+        second = ToolRegistry()
+        snapshot = first._take_transaction_snapshot()
+
+        with pytest.raises(ValueError, match="different ToolRegistry"):
+            second._restore_transaction_snapshot(snapshot)
 
 class TestGetDefinitions:
     def test_returns_openai_format(self):

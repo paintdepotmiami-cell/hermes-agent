@@ -248,7 +248,12 @@ def _has_middleware(kind: str) -> bool:
 def _get_middleware_callbacks(kind: str) -> List[Callable]:
     from hermes_cli.plugins import get_plugin_manager
 
-    return list(get_plugin_manager()._middleware.get(kind, []))
+    manager = get_plugin_manager()
+    accessor = getattr(manager, "get_middleware_callbacks", None)
+    if accessor is not None:
+        return accessor(kind)
+    # Backward-compatible duck typing for embedded hosts and test doubles.
+    return list(getattr(manager, "_middleware", {}).get(kind, []))
 
 
 def _run_execution_chain(

@@ -1187,6 +1187,22 @@ describe('createGatewayEventHandler', () => {
     expect(getOverlayState().approval).toMatchObject({ choices: ['once', 'deny'], smartDenied: true })
   })
 
+  it('preserves the opaque id on a fresh approval overlay', () => {
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+
+    onEvent({
+      payload: {
+        approval_id: 'fresh-id-17',
+        choices: ['once', 'deny'],
+        command: 'sentinel operation',
+        description: 'fresh approval'
+      },
+      type: 'approval.request'
+    } as any)
+
+    expect(getOverlayState().approval).toMatchObject({ approvalId: 'fresh-id-17' })
+  })
+
   it('still surfaces terminal turn failures as errors', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))

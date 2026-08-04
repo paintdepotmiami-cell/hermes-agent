@@ -8,10 +8,12 @@ not contend with the serving process' event loop for the same GIL.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import queue
+import secrets
 import signal
 import subprocess
 import sys
@@ -47,6 +49,8 @@ MUTATOR_ROUTE_TABLE: dict[str, str] = {
 _REGISTRY_NAME = "dashboard-compute-host.json"
 _RESPAWN_WINDOW_SECS = 300.0
 _SHUTDOWN_TIMEOUT_SECS = 10.0
+_IPC_MAC_KEY_ENV = "HERMES_COMPUTE_HOST_IPC_MAC_KEY"
+_IPC_MAC_KEY_BYTES = 32
 
 
 def append_log_record(path: str | Path, record: str) -> None:
@@ -169,6 +173,7 @@ class HostSupervisor:
         self._pending_controls: dict[str, queue.Queue[dict]] = {}
         self._stderr_tail: list[str] = []
         self._last_progress_counter = 0
+        self._ipc_mac_key: bytes | None = None
 
         if autostart:
             self.start()
@@ -208,6 +213,9 @@ class HostSupervisor:
             self._terminate_process(proc)
         finally:
             self._remove_registry()
+            with self._lock:
+                if self._proc is proc:
+                    self._ipc_mac_key = None
 
     def reconcile_startup_orphan(self) -> str:
         """Terminate a stale registered host, guarding against PID reuse."""
@@ -250,7 +258,22 @@ class HostSupervisor:
         with self._lock:
             self._pending_turns[request_id] = (sid, on_complete)
         try:
-            self._send_frame(payload)
+            with self._lock:
+                if "trusted_interaction" in payload:
+                    from agent._trusted_interaction_issuer import (
+                        _attach_trusted_interaction_ipc_mac,
+                    )
+
+                    signed = _attach_trusted_interaction_ipc_mac(
+                        payload["trusted_interaction"],
+                        mac_key=self._ipc_mac_key,
+                    )
+                    if signed is None:
+                        raise RuntimeError(
+                            "compute host trusted interaction authentication failed"
+                        )
+                    payload["trusted_interaction"] = signed
+                self._send_frame(payload)
         except Exception as exc:
             with self._lock:
                 self._pending_turns.pop(request_id, None)
@@ -313,16 +336,30 @@ class HostSupervisor:
     def _spawn_locked(self, *, reason: str) -> None:
         if self._stopped_respawning:
             raise RuntimeError("compute host respawn disabled after crash loop")
+        self._ipc_mac_key = None
         self._hello_event.clear()
         self._hello = {}
+        ipc_mac_key = secrets.token_bytes(_IPC_MAC_KEY_BYTES)
+        if not isinstance(ipc_mac_key, bytes) or len(ipc_mac_key) != _IPC_MAC_KEY_BYTES:
+            raise RuntimeError("compute host IPC MAC key generation failed")
+        encoded_ipc_mac_key = base64.urlsafe_b64encode(ipc_mac_key).decode(
+            "ascii"
+        )
         env = hermes_subprocess_env(inherit_credentials=True)
-        env.update(os.environ)
         if self.env:
             env.update(self.env)
+        env[_IPC_MAC_KEY_ENV] = encoded_ipc_mac_key
         env["HERMES_COMPUTE_HOST_HEARTBEAT_SECS"] = str(self.heartbeat_secs)
         env.setdefault("PYTHONPATH", str(_repo_root()))
         if str(_repo_root()) not in env["PYTHONPATH"].split(os.pathsep):
             env["PYTHONPATH"] = str(_repo_root()) + os.pathsep + env["PYTHONPATH"]
+        from private_secret_policy import scrub_private_secret_env
+
+        env = scrub_private_secret_env(env)
+        if env.get(_IPC_MAC_KEY_ENV) != encoded_ipc_mac_key:
+            raise RuntimeError(
+                "compute host IPC MAC key was removed by child environment policy"
+            )
         proc = subprocess.Popen(
             self.argv,
             cwd=str(self.cwd),
@@ -339,6 +376,7 @@ class HostSupervisor:
             bufsize=1,
             start_new_session=True,
         )
+        self._ipc_mac_key = ipc_mac_key
         self._proc = proc
         self._stdout_thread = _Thread(target=self._drain_stdout, args=(proc,), name="compute-host-stdout", daemon=True)
         self._stderr_thread = _Thread(target=self._drain_stderr, args=(proc,), name="compute-host-stderr", daemon=True)
@@ -471,6 +509,7 @@ class HostSupervisor:
             if self._proc is not proc:
                 return
             self._proc = None
+            self._ipc_mac_key = None
         self._remove_registry()
         self._fail_pending_turns(reason="crash", message=f"compute host exited with code {code}")
         self._maybe_respawn_after_crash()

@@ -3693,16 +3693,25 @@ class BasePlatformAdapter(ABC):
         command: str,
         description: str = "dangerous command",
         smart_denied: bool = False,
+        *,
+        truncate_command: bool = True,
     ) -> str:
         """Shared formatting core for exec-approval prompt text.
 
-        Assembles ``_EA_HEADER`` + fenced command preview (truncated to
-        ``_EA_CMD_BUDGET``) + ``_EA_REASON_LABEL`` + description, plus
-        ``_EA_SMART_DENY_LINE`` when ``smart_denied``. Button construction
-        stays platform-local; adapters with additional trailing instructions
-        (e.g. reaction legends) append them to this core.
+        Assembles ``_EA_HEADER`` + fenced command preview +
+        ``_EA_REASON_LABEL`` + description, plus ``_EA_SMART_DENY_LINE`` when
+        ``smart_denied``. Legacy callers use the established
+        ``_EA_CMD_BUDGET`` cap. Exact fresh approvals can disable that cap so
+        the displayed preview remains identical to the bound preview. Button
+        construction stays platform-local; adapters with additional trailing
+        instructions (e.g. reaction legends) append them to this core.
         """
-        cmd_preview = self._truncate_preview(str(command or ""), self._EA_CMD_BUDGET)
+        command_text = str(command or "")
+        cmd_preview = (
+            self._truncate_preview(command_text, self._EA_CMD_BUDGET)
+            if truncate_command
+            else command_text
+        )
         text = (
             f"{self._EA_HEADER}"
             f"{self._EA_CODE_OPEN}{self._ea_escape(cmd_preview)}{self._EA_CODE_CLOSE}"

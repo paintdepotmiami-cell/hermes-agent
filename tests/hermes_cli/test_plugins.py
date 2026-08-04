@@ -187,16 +187,16 @@ class TestPluginDiscovery:
 
 
 
-    def test_force_rediscover_clears_all_plugin_registries(self, monkeypatch):
-        """force=True must clear every plugin-populated registry.
+    def test_force_rediscover_replaces_all_plugin_registries(self, monkeypatch):
+        """force=True must publish a clean replacement generation.
 
         Regression: ``_plugin_platform_names`` was populated by
         ``register_platform`` but omitted from the ``discover_and_load(force=True)``
-        clear block, so a platform plugin disabled between force-rediscovers
+        replacement, so a platform plugin disabled between force-rediscovers
         left a stale entry behind forever (the set diverged from the real
-        platform_registry / _plugins truth). This asserts the clear block
-        empties the full set of per-plugin registries so no future addition
-        silently leaks across a force pass either.
+        platform_registry / _plugins truth). This asserts the committed
+        candidate replaces the full set of per-plugin registries so no future
+        addition silently leaks across a force pass either.
         """
         mgr = PluginManager()
 
@@ -208,6 +208,7 @@ class TestPluginDiscovery:
         mgr._middleware["llm_request"] = [lambda **_: None]
         mgr._plugin_tool_names.add("some_tool")
         mgr._plugin_platform_names.add("irc")
+        mgr._plugin_external_names["platform"].add("irc")
         mgr._cli_commands["c"] = {"plugin": "p"}
         mgr._plugin_commands["cmd"] = {"plugin": "p"}
         mgr._plugin_skills["p:skill"] = {}
@@ -215,7 +216,11 @@ class TestPluginDiscovery:
         mgr._slack_action_handlers.append(("aid", lambda **_: None, "p"))
         mgr._discovered = True
 
-        monkeypatch.setattr(PluginManager, "_discover_and_load_inner", lambda self_inner: None)
+        monkeypatch.setattr(
+            PluginManager,
+            "_discover_and_load_inner",
+            lambda self_inner, transaction=None: None,
+        )
         mgr.discover_and_load(force=True)
 
         assert mgr._plugins == {}
@@ -225,6 +230,7 @@ class TestPluginDiscovery:
         assert mgr._plugin_platform_names == set(), (
             "_plugin_platform_names was not cleared on force-rediscover"
         )
+        assert all(not names for names in mgr._plugin_external_names.values())
         assert mgr._cli_commands == {}
         assert mgr._plugin_commands == {}
         assert mgr._plugin_skills == {}

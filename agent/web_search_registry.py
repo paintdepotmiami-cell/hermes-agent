@@ -37,16 +37,21 @@ import threading
 from typing import Dict, List, Optional
 
 from agent.web_search_provider import WebSearchProvider
+from registry_transaction import MappingRegistry, RegistryTransactionSurface
 
 logger = logging.getLogger(__name__)
 
 
 _providers: Dict[str, WebSearchProvider] = {}
-_lock = threading.Lock()
+_lock = threading.RLock()
+_registry_state = MappingRegistry("web", _providers, _lock)
 
 
-def register_provider(provider: WebSearchProvider) -> None:
-    """Register a web search/extract provider.
+def _register_provider_in(
+    target: MappingRegistry,
+    provider: WebSearchProvider,
+) -> str:
+    """Validate and register into a live registry or isolated transaction view.
 
     Re-registration (same ``name``) overwrites the previous entry and logs
     a debug message — makes hot-reload scenarios (tests, dev loops) behave
@@ -60,9 +65,7 @@ def register_provider(provider: WebSearchProvider) -> None:
     name = provider.name
     if not isinstance(name, str) or not name.strip():
         raise ValueError("Web provider .name must be a non-empty string")
-    with _lock:
-        existing = _providers.get(name)
-        _providers[name] = provider
+    _added, existing = target.put(name, provider)
     if existing is not None:
         logger.debug(
             "Web provider '%s' re-registered (was %r)",
@@ -73,12 +76,23 @@ def register_provider(provider: WebSearchProvider) -> None:
             "Registered web provider '%s' (%s)",
             name, type(provider).__name__,
         )
+    return name
+
+
+def register_provider(provider: WebSearchProvider) -> None:
+    """Register a web search/extract provider."""
+    _register_provider_in(_registry_state, provider)
+
+
+_plugin_transaction = RegistryTransactionSurface(
+    _registry_state,
+    _register_provider_in,
+)
 
 
 def list_providers() -> List[WebSearchProvider]:
     """Return all registered providers, sorted by name."""
-    with _lock:
-        items = list(_providers.values())
+    items = _registry_state.values()
     return sorted(items, key=lambda p: p.name)
 
 
@@ -86,8 +100,7 @@ def get_provider(name: str) -> Optional[WebSearchProvider]:
     """Return the provider registered under *name*, or None."""
     if not isinstance(name, str):
         return None
-    with _lock:
-        return _providers.get(name.strip())
+    return _registry_state.get(name.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -160,8 +173,7 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
     matches the legacy preference; the dispatcher then returns a "set up a
     provider" error to the user.
     """
-    with _lock:
-        snapshot = dict(_providers)
+    snapshot = dict(_registry_state.items_snapshot())
 
     def _capable(p: WebSearchProvider) -> bool:
         if capability == "search":
@@ -300,5 +312,4 @@ def get_active_extract_provider() -> Optional[WebSearchProvider]:
 
 def _reset_for_tests() -> None:
     """Clear the registry. **Test-only.**"""
-    with _lock:
-        _providers.clear()
+    _registry_state.clear()

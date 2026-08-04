@@ -1003,12 +1003,13 @@ def _terminate_command_tts_process_tree(proc: subprocess.Popen) -> None:
 
 
 def _command_provider_env_passthrough(config: Dict[str, Any]) -> list:
-    """Return the provider's ``env_passthrough`` allowlist (opt-out of scrub).
+    """Return the provider's ``env_passthrough`` allowlist.
 
     Command providers legitimately reference their own API keys in the shell
     template (curl one-liners). The child env is scrubbed of Hermes secrets by
     default; ``env_passthrough: [MY_API_KEY, ...]`` copies the named variables
     back from the parent environment so a trusted template keeps working.
+    Enabled-plugin private names remain non-overridable at the final boundary.
     """
     raw = config.get("env_passthrough")
     if not isinstance(raw, (list, tuple)):
@@ -1034,6 +1035,10 @@ def _run_command_tts(
         value = os.environ.get(key)
         if value is not None:
             scrubbed[key] = value
+    child_env = delegated_child_subprocess_env(scrubbed)
+    from private_secret_policy import scrub_private_secret_env
+
+    child_env = scrub_private_secret_env(child_env or {})
     popen_kwargs: Dict[str, Any] = {
         "shell": True,
         "stdout": subprocess.PIPE,
@@ -1043,7 +1048,7 @@ def _run_command_tts(
         # must not raise in the reader threads on non-UTF-8 Windows (#45099).
         "encoding": "utf-8",
         "errors": "replace",
-        "env": delegated_child_subprocess_env(scrubbed),
+        "env": child_env,
     }
     if os.name == "nt":
         popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -1258,6 +1263,13 @@ def _convert_to_opus(mp3_path: str) -> Optional[str]:
     return _ffmpeg_transcode_to_opus(mp3_path, ogg_path)
 
 
+def _fixed_ffmpeg_child_env() -> dict[str, str]:
+    """Return a parent-env copy after the host-private final deny scrub."""
+    from private_secret_policy import scrub_private_secret_env
+
+    return scrub_private_secret_env(dict(os.environ))
+
+
 def _ffmpeg_transcode_to_opus(input_path: str, ogg_path: str) -> Optional[str]:
     """Transcode *input_path* to real Ogg/Opus at *ogg_path* via ffmpeg.
 
@@ -1277,6 +1289,7 @@ def _ffmpeg_transcode_to_opus(input_path: str, ogg_path: str) -> Optional[str]:
              work_path, "-y"],
             capture_output=True, timeout=30,
             stdin=subprocess.DEVNULL,
+            env=_fixed_ffmpeg_child_env(),
             creationflags=windows_hide_flags(),
         )
         if result.returncode != 0:
@@ -2399,7 +2412,7 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
                 ]
             else:
                 cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
-            result = subprocess.run(cmd, capture_output=True, timeout=30, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
+            result = subprocess.run(cmd, capture_output=True, timeout=30, stdin=subprocess.DEVNULL, env=_fixed_ffmpeg_child_env(), creationflags=windows_hide_flags())
             if result.returncode != 0:
                 stderr = result.stderr.decode("utf-8", errors="ignore")[:300]
                 raise RuntimeError(f"ffmpeg conversion failed: {stderr}")
@@ -2494,7 +2507,7 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg:
             conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
-            subprocess.run(conv_cmd, check=True, timeout=30, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
+            subprocess.run(conv_cmd, check=True, timeout=30, stdin=subprocess.DEVNULL, env=_fixed_ffmpeg_child_env(), creationflags=windows_hide_flags())
             os.remove(wav_path)
         else:
             # No ffmpeg — just rename the WAV to the expected path
@@ -2701,7 +2714,7 @@ def _generate_piper_tts(text: str, output_path: str, tts_config: Dict[str, Any])
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg:
             conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
-            subprocess.run(conv_cmd, check=True, timeout=30, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
+            subprocess.run(conv_cmd, check=True, timeout=30, stdin=subprocess.DEVNULL, env=_fixed_ffmpeg_child_env(), creationflags=windows_hide_flags())
             try:
                 os.remove(wav_path)
             except OSError:
@@ -2767,7 +2780,7 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg:
             conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
-            subprocess.run(conv_cmd, check=True, timeout=30, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
+            subprocess.run(conv_cmd, check=True, timeout=30, stdin=subprocess.DEVNULL, env=_fixed_ffmpeg_child_env(), creationflags=windows_hide_flags())
             os.remove(wav_path)
         else:
             # No ffmpeg — rename the WAV to the expected path

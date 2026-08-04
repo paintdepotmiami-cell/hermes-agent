@@ -223,6 +223,24 @@ describe('respondToApprovalAction', () => {
     expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'deny', session_id: 'bg' })
   })
 
+  it('uses only server-issued id and decision for a fresh background approval', async () => {
+    setActiveSessionId('bg')
+    setApprovalRequest({
+      approvalId: 'fresh-bg-1',
+      choices: ['once', 'deny'],
+      command: 'rm -rf /',
+      description: 'dangerous',
+      sessionId: 'bg'
+    })
+
+    await respondToApprovalAction('bg', 'approve')
+
+    expect(request).toHaveBeenCalledWith('approval.respond', {
+      approval_id: 'fresh-bg-1',
+      decision: 'approve_once'
+    })
+  })
+
   it('ignores unknown action ids', async () => {
     await respondToApprovalAction('bg', 'snooze')
     expect(request).not.toHaveBeenCalled()

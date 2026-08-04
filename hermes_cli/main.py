@@ -11629,7 +11629,7 @@ def main():
             # so its register_cli_command side effect runs before we read
             # _cli_commands (issue #54678).
             _resolve_deferred_platform_cli_command(_first_positional_argv())
-            for cmd_info in get_plugin_manager()._cli_commands.values():
+            for cmd_info in get_plugin_manager().get_cli_commands().values():
                 if cmd_info["name"] in seen_plugin_commands:
                     continue
                 plugin_parser = subparsers.add_parser(

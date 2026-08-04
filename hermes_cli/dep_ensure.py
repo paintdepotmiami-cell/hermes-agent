@@ -153,6 +153,9 @@ def ensure_dependency(
 
     run_env = hermes_subprocess_env(inherit_credentials=False)
     run_env["IS_INTERACTIVE"] = "false"
+    from private_secret_policy import scrub_private_secret_env
+
+    run_env = scrub_private_secret_env(run_env)
     result = subprocess.run(
         cmd,
         env=run_env,

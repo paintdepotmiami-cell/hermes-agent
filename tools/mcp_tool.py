@@ -456,7 +456,9 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
     credentials to MCP server subprocesses.  Secret-source-injected vars are
     an exception: users configured that backend specifically so Hermes and
     its subprocesses can consume those credentials without duplicating them
-    in every MCP server's ``env:`` block.
+    in every MCP server's ``env:`` block. Names declared private by an enabled
+    plugin remain excluded even when secret-source tagged or explicitly set in
+    the MCP server's ``env:`` block.
     """
     try:
         from hermes_cli.env_loader import get_secret_source
@@ -473,7 +475,9 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
             env[key] = value
     if user_env:
         env.update(user_env)
-    return env
+    from private_secret_policy import scrub_private_secret_env
+
+    return scrub_private_secret_env(env)
 
 
 def _sanitize_error(text: str) -> str:
@@ -2433,6 +2437,12 @@ class MCPServerTask:
         # package, not the watchdog wrapper.
         command, args = _wrap_command_with_watchdog(command, args)
 
+        # Command resolution may add PATH after _build_safe_env's scrub. Apply
+        # the current policy again at the actual SDK child boundary.
+        from private_secret_policy import scrub_private_secret_env
+
+        safe_env = scrub_private_secret_env(safe_env)
+
         server_params = StdioServerParameters(
             command=command,
             args=args,
@@ -2770,9 +2780,9 @@ class MCPServerTask:
         ssl_verify = config.get("ssl_verify", True)
         client_cert = _resolve_client_cert(self.name, config)
 
-        # OAuth 2.1 PKCE: route through the central MCPOAuthManager so the
-        # same provider instance is reused across reconnects, pre-flow
-        # disk-watch is active, and config-time CLI code paths share state.
+        # OAuth: route browser PKCE and autonomous client-credentials flows
+        # through the central MCPOAuthManager so the provider is reused across
+        # reconnects and config-time CLI code paths share state.
         # If OAuth setup fails (e.g. non-interactive env without cached
         # tokens), re-raise so this server is reported as failed without
         # blocking other MCP servers from connecting.
@@ -3647,6 +3657,43 @@ def _reset_server_error(server_name: str) -> None:
     _server_breaker_opened_at.pop(server_name, None)
 
 
+def _classify_mcp_call_result(result: object) -> str:
+    action = getattr(result, "breaker_action", None)
+    if action in {"bump", "reset", "ignore"}:
+        return action
+    try:
+        parsed = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return "reset"
+    return "bump" if "error" in parsed else "reset"
+
+
+def _apply_mcp_result_accounting(server_name: str, result: object) -> str:
+    action = _classify_mcp_call_result(result)
+    if action == "bump":
+        _bump_server_error(server_name)
+    elif action == "reset":
+        _reset_server_error(server_name)
+    return result
+
+
+def _breaker_short_circuit_result(server_name: str) -> str | None:
+    if _server_error_counts.get(server_name, 0) < _CIRCUIT_BREAKER_THRESHOLD:
+        return None
+    opened_at = _server_breaker_opened_at.get(server_name, 0.0)
+    age = time.monotonic() - opened_at
+    if age >= _CIRCUIT_BREAKER_COOLDOWN_SEC:
+        return None
+    remaining = max(1, int(_CIRCUIT_BREAKER_COOLDOWN_SEC - age))
+    return tool_error(
+        f"MCP server '{server_name}' is unreachable after "
+        f"{_server_error_counts[server_name]} consecutive "
+        f"failures. Auto-retry available in ~{remaining}s. "
+        f"Do NOT retry this tool yet — use alternative "
+        f"approaches or ask the user to check the MCP server."
+    )
+
+
 def _signal_reconnect(server: Any) -> bool:
     """Ask a server task to rebuild its transport, thread-safely.
 
@@ -3912,6 +3959,8 @@ def _handle_auth_error_and_retry(
 
         try:
             result = retry_call()
+            if getattr(result, "breaker_action", None) in {"bump", "reset", "ignore"}:
+                return _apply_mcp_result_accounting(server_name, result)
             try:
                 parsed = json.loads(result)
                 if "error" not in parsed:
@@ -4106,6 +4155,8 @@ def _handle_session_expired_and_retry(
 
     try:
         result = retry_call()
+        if getattr(result, "breaker_action", None) in {"bump", "reset", "ignore"}:
+            return _apply_mcp_result_accounting(server_name, result)
         try:
             parsed = json.loads(result)
             if "error" not in parsed:
@@ -4875,7 +4926,15 @@ def _mark_server_call_started(server: Any) -> None:
         mark_tool_call()
 
 
-def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
+def _make_tool_handler(
+    server_name: str,
+    tool_name: str,
+    tool_timeout: float,
+    *,
+    governed_descriptor=None,
+    governed_server=None,
+    governed_session=None,
+):
     """Return a sync handler that calls an MCP tool via the background loop.
 
     The handler conforms to the registry's dispatch interface:
@@ -4883,29 +4942,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
-        # Circuit breaker: if this server has failed too many times
-        # consecutively, short-circuit with a clear message so the model
-        # stops retrying and uses alternative approaches (#10447).
-        #
-        # Once the cooldown elapses, the breaker transitions to
-        # half-open: we let the *next* call through as a probe. On
-        # success the success-path below resets the breaker; on
-        # failure the error paths below bump the count again, which
-        # re-stamps the open-time via _bump_server_error (re-arming
-        # the cooldown).
-        if _server_error_counts.get(server_name, 0) >= _CIRCUIT_BREAKER_THRESHOLD:
-            opened_at = _server_breaker_opened_at.get(server_name, 0.0)
-            age = time.monotonic() - opened_at
-            if age < _CIRCUIT_BREAKER_COOLDOWN_SEC:
-                remaining = max(1, int(_CIRCUIT_BREAKER_COOLDOWN_SEC - age))
-                return tool_error(
-                    f"MCP server '{server_name}' is unreachable after "
-                    f"{_server_error_counts[server_name]} consecutive "
-                    f"failures. Auto-retry available in ~{remaining}s. "
-                    f"Do NOT retry this tool yet — use alternative "
-                    f"approaches or ask the user to check the MCP server."
-                )
-            # Cooldown elapsed → fall through as a half-open probe.
+        governed_read_only_retry = None
+        governed_read_only_session = None
+        governed_read_only_blocked = None
+        breaker_result = _breaker_short_circuit_result(server_name)
+        if breaker_result is not None:
+            return breaker_result
 
         server = _get_connected_server_for_call(server_name)
         if not server:
@@ -4942,16 +4984,135 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     )
                 return tool_error(f"MCP server '{server_name}' is not connected")
 
-        async def _call():
+        # Exact-server governors are selected at invocation so a transactional
+        # plugin load/force-reload never requires rebuilding the model tool
+        # schema. Their handler snapshot, however, is discovery-owned: session
+        # swaps or metadata drift must block instead of silently retargeting.
+        from tools.governed_mcp_dispatch import _GovernanceViolation
+
+        try:
+            from hermes_cli.plugins import get_mcp_governor
+
+            governor = get_mcp_governor(server_name)
+        except Exception:
+            logger.warning(
+                "MCP governance lookup failed for server %s; blocking tool call",
+                server_name,
+            )
+            return json.dumps(
+                {
+                    "dispatch_count": 0,
+                    "dispatch_started": False,
+                    "dispatch_tool": None,
+                    "invoked_tool": tool_name,
+                    "operation_hash": None,
+                    "outcome": {"summary": "MCP governance registry is unavailable"},
+                    "preflight_completed": False,
+                    "preflight_count": 0,
+                    "preflight_started": False,
+                    "server": server_name,
+                    "status": "blocked",
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        if governor is not None:
+            current_governed_session = (
+                getattr(governed_server, "session", None)
+                if governed_server is not None
+                else None
+            )
+            if (
+                governed_descriptor is None
+                or governed_server is None
+                or current_governed_session is None
+            ):
+                return json.dumps(
+                    {
+                        "dispatch_count": 0,
+                        "dispatch_started": False,
+                        "dispatch_tool": None,
+                        "invoked_tool": tool_name,
+                        "operation_hash": None,
+                        "outcome": {
+                            "summary": "governed MCP descriptor snapshot is unavailable"
+                        },
+                        "preflight_completed": False,
+                        "preflight_count": 0,
+                        "preflight_started": False,
+                        "server": server_name,
+                        "status": "blocked",
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            from tools.governed_mcp_dispatch import (
+                _READ_ONLY_PASS_THROUGH,
+                _audit_json,
+                _target_is_current,
+                dispatch_governed_mcp,
+            )
+
+            governed_result = dispatch_governed_mcp(
+                registration=governor,
+                descriptor=governed_descriptor,
+                server=governed_server,
+                session=current_governed_session,
+                arguments=args,
+                tool_timeout=tool_timeout,
+            )
+            if governed_result is not _READ_ONLY_PASS_THROUGH:
+                return _apply_mcp_result_accounting(server_name, governed_result)
+            governed_read_only_session = current_governed_session
+            governed_read_only_blocked = lambda: _audit_json(
+                descriptor=governed_descriptor,
+                status="blocked",
+                services=None,
+                summary="read-only pass-through validation failed",
+            )
+
+            def _retry_read_only_governed_call() -> str:
+                retry_session = getattr(governed_server, "session", None)
+                retry_result = dispatch_governed_mcp(
+                    registration=governor,
+                    descriptor=governed_descriptor,
+                    server=governed_server,
+                    session=retry_session,
+                    arguments=args,
+                    tool_timeout=tool_timeout,
+                )
+                if retry_result is not _READ_ONLY_PASS_THROUGH:
+                    return retry_result
+                return _call_once(read_only_session=retry_session)
+
+            governed_read_only_retry = _retry_read_only_governed_call
+
+        async def _call(*, read_only_session=None):
             _mark_server_call_started(server)
             async with server._rpc_lock:
+                call_session = server.session
+                if read_only_session is not None:
+                    if (
+                        server is not governed_server
+                        or not _target_is_current(
+                            governed_server,
+                            read_only_session,
+                            governed_descriptor,
+                        )
+                    ):
+                        raise _GovernanceViolation(
+                            "read-only target changed before SDK call"
+                        )
+                    call_session = read_only_session
                 # Snapshot the agent's context so an elicitation callback
                 # triggered during this call (fired on the MCP recv loop
                 # task, which doesn't inherit our contextvars) can replay
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    result = await call_session.call_tool(tool_name, arguments=args)
                 finally:
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably
@@ -5040,21 +5201,22 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 return json.dumps({"result": structured}, ensure_ascii=False)
             return json.dumps({"result": text_result}, ensure_ascii=False)
 
-        def _call_once():
-            return _run_on_mcp_loop(_call, timeout=tool_timeout)
+        def _call_once(*, read_only_session=None):
+            try:
+                return _run_on_mcp_loop(
+                    lambda: _call(read_only_session=read_only_session),
+                    timeout=tool_timeout,
+                )
+            except _GovernanceViolation:
+                if governed_read_only_blocked is not None:
+                    return governed_read_only_blocked()
+                raise
+
+        retry_call = governed_read_only_retry or _call_once
 
         try:
-            result = _call_once()
-            # Check if the MCP tool itself returned an error
-            try:
-                parsed = json.loads(result)
-                if "error" in parsed:
-                    _bump_server_error(server_name)
-                else:
-                    _reset_server_error(server_name)  # success — reset
-            except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)  # non-JSON = success
-            return result
+            result = _call_once(read_only_session=governed_read_only_session)
+            return _apply_mcp_result_accounting(server_name, result)
         except InterruptedError:
             return _interrupted_call_result()
         except Exception as exc:
@@ -5062,7 +5224,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # reconnect if viable, retry once. Returns None to fall
             # through for non-auth exceptions.
             recovered = _handle_auth_error_and_retry(
-                server_name, exc, _call_once,
+                server_name, exc, retry_call,
                 f"tools/call {tool_name}",
             )
             if recovered is not None:
@@ -5072,7 +5234,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # but skips OAuth recovery because the access token is
             # still valid — only the server-side session is stale.
             recovered = _handle_session_expired_and_retry(
-                server_name, exc, _call_once,
+                server_name, exc, retry_call,
                 f"tools/call {tool_name}",
             )
             if recovered is not None:
@@ -5865,13 +6027,39 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
 
         _scan_mcp_description(name, mcp_tool.name, mcp_tool.description or "")
         schema = _convert_mcp_schema(name, mcp_tool)
+        try:
+            from tools.governed_mcp_dispatch import build_mcp_tool_descriptor
+
+            governed_descriptor = build_mcp_tool_descriptor(
+                name,
+                schema["name"],
+                mcp_tool,
+            )
+        except Exception as exc:
+            # Keep the established non-governed path tolerant of legacy SDK
+            # stand-ins and malformed servers. A later governor claim will
+            # fail closed because this handler has no canonical snapshot; it
+            # can never turn the metadata failure into governed dispatch.
+            governed_descriptor = None
+            logger.debug(
+                "MCP server '%s': governed metadata unavailable for raw "
+                "tool '%s': %s",
+                name,
+                mcp_tool.name,
+                type(exc).__name__,
+            )
         candidates.append(
             {
                 "registry_name": schema["name"],
                 "origin": f"tool {mcp_tool.name!r}",
                 "schema": schema,
                 "handler": _make_tool_handler(
-                    name, mcp_tool.name, server.tool_timeout
+                    name,
+                    mcp_tool.name,
+                    server.tool_timeout,
+                    governed_descriptor=governed_descriptor,
+                    governed_server=server,
+                    governed_session=server.session,
                 ),
                 "check_fn": check_fn,
             }

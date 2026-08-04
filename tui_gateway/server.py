@@ -899,6 +899,9 @@ def _teardown_popped_session(
     """Finish a close after the caller has atomically detached the session."""
     if session is None:
         return False
+    _clear_local_trusted_interaction(
+        session_key=str(session.get("session_key") or "") or None
+    )
     _teardown_session(session, end_reason=end_reason)
     return True
 
@@ -1631,6 +1634,7 @@ def _compute_host_turn_frame(
     text: Any,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    trusted_interaction=None,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -1640,7 +1644,7 @@ def _compute_host_turn_frame(
             if image_paths is not None
             else list(session.get("attached_images", []))
         )
-    return {
+    frame = {
         "type": "turn.start",
         "sid": sid,
         "request_id": rid,
@@ -1658,6 +1662,15 @@ def _compute_host_turn_frame(
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,
     }
+    if trusted_interaction is not None:
+        from agent._trusted_interaction_issuer import (
+            _serialize_trusted_interaction,
+        )
+
+        frame["trusted_interaction"] = _serialize_trusted_interaction(
+            trusted_interaction
+        )
+    return frame
 
 
 def _metadata_mirror(session: dict | None) -> dict:
@@ -1734,6 +1747,7 @@ def _submit_prompt_to_compute_host(
     text: Any,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    trusted_interaction=None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -1743,6 +1757,7 @@ def _submit_prompt_to_compute_host(
         text,
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
+        trusted_interaction=trusted_interaction,
     )
 
     def _complete(done: dict) -> None:
@@ -1794,7 +1809,11 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
     platforms and the SSE/API stream fixed in #50767). Reuse the shared gateway
     seam so all approval transports redact consistently."""
     payload = dict(data or {})
-    if "choices" not in payload:
+    if payload.get("approval_id"):
+        payload["choices"] = ["once", "deny"]
+        payload["allow_permanent"] = False
+        payload["allow_session"] = False
+    elif "choices" not in payload:
         if payload.get("smart_denied"):
             payload["choices"] = ["once", "deny"]
         elif payload.get("allow_permanent") is False:
@@ -3039,6 +3058,7 @@ def _set_session_context(
     cwd: str | None = None,
     *,
     ui_session_id: str = "",
+    trusted_interaction=None,
 ) -> list:
     try:
         from gateway.session_context import set_session_vars
@@ -3067,16 +3087,89 @@ def _set_session_context(
                         getattr(sess.get("agent"), "session_id", None) or session_key
                     )
                     break
+        trusted = trusted_interaction
         return set_session_vars(
+            platform=(trusted.platform if trusted is not None else ""),
             session_key=session_key,
             session_id=session_id,
-            source=source,
+            source=(trusted.surface if trusted is not None else source),
+            chat_id=(trusted.chat_id if trusted is not None else ""),
+            thread_id=(
+                trusted.thread_id or "" if trusted is not None else ""
+            ),
+            user_id=(trusted.actor_id if trusted is not None else ""),
+            profile=(trusted.profile_id if trusted is not None else ""),
             cwd=resolved,
             ui_session_id=ui_session_id,
             cron_session="",
         )
     except Exception:
         return []
+
+
+def _trusted_profile_id_for_session(session: dict) -> str:
+    profile_id = str(session.get("profile_id") or "").strip()
+    if profile_id:
+        return profile_id
+    profile_home = str(session.get("profile_home") or "").strip()
+    if profile_home:
+        try:
+            return Path(profile_home).name or "default"
+        except Exception:
+            pass
+    try:
+        return _current_profile_name() or "default"
+    except Exception:
+        return "default"
+
+
+def _issue_local_trusted_interaction(
+    sid: str,
+    session: dict,
+    transport: Transport,
+):
+    """Mint provenance only from server-owned transport/session identity."""
+    from agent._trusted_interaction_issuer import _issue_trusted_interaction
+    from tui_gateway.transport import _host_transport_identity
+
+    session_key = str(session.get("session_key") or "").strip()
+    if not sid or not session_key:
+        return None
+    transport_id = _host_transport_identity(transport)
+    return _issue_trusted_interaction(
+        surface=_resolve_session_platform(),
+        platform="local",
+        actor_id=transport_id,
+        channel_id=transport_id,
+        chat_id=str(sid),
+        thread_id=None,
+        session_key=session_key,
+        # Local provenance distinguishes the server-assigned live runtime id
+        # from the durable session_key, matching the desktop session contract.
+        session_id=str(sid),
+        message_id=f"local_message_{uuid.uuid4().hex}",
+        received_at=time.time(),
+        profile_id=_trusted_profile_id_for_session(session),
+    )
+
+
+def _publish_local_trusted_interaction(interaction) -> None:
+    if interaction is None:
+        return
+    from agent._trusted_interaction_issuer import _publish_trusted_interaction
+
+    _publish_trusted_interaction(interaction)
+
+
+def _clear_local_trusted_interaction(*, session_key: str | None = None, interaction=None) -> None:
+    if session_key is None and interaction is None:
+        return
+    from agent._trusted_interaction_issuer import _clear_trusted_interactions
+
+    _clear_trusted_interactions(
+        session_key=session_key,
+        interaction=interaction,
+    )
 
 
 def _clear_session_context(tokens: list) -> None:
@@ -6098,6 +6191,9 @@ def _preview_restart_callbacks(parent: str, task_id: str) -> dict:
 
 
 def _reset_session_agent(sid: str, session: dict) -> dict:
+    _clear_local_trusted_interaction(
+        session_key=str(session.get("session_key") or "") or None
+    )
     tokens = _set_session_context(session["session_key"])
     try:
         # /new is a full conversation boundary: session-scoped runtime
@@ -7311,6 +7407,7 @@ def _enqueue_prompt(
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
+    trusted_interaction=None,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -7320,11 +7417,18 @@ def _enqueue_prompt(
     separate envelopes, so their attachment ownership and chronology survive.
     ``transport`` is pinned so the drained turn streams back to the client that
     sent it even if the session transport is rebound meanwhile.
+
+    Provenance rule: when text envelopes merge into one model turn, that turn
+    keeps the latest accepted interaction, never the first.  The merged text is
+    ordered history, but governance must authenticate the most recent input
+    that shaped the action.
     """
     image_paths = list(image_paths or [])
     queued = {"text": text, "transport": transport}
     if image_paths:
         queued["image_paths"] = image_paths
+    if trusted_interaction is not None:
+        queued["trusted_interaction"] = trusted_interaction
     existing = session.get("queued_prompt")
     if (
         existing
@@ -7336,6 +7440,8 @@ def _enqueue_prompt(
     ):
         prev = existing["text"]
         existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
+        if trusted_interaction is not None:
+            existing["trusted_interaction"] = trusted_interaction
         return
     if existing:
         session.setdefault("queued_prompts", []).append(queued)
@@ -7379,7 +7485,13 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    queued: bool = False,
+    trusted_interaction=None,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -7422,6 +7534,7 @@ def _handle_busy_submit(
             if agent.steer(plain_text):
                 with session["history_lock"]:
                     session["last_active"] = time.time()
+                    _publish_local_trusted_interaction(trusted_interaction)
                 return _ok(rid, {"status": "steered"})
         except Exception:
             pass  # fall through to queue
@@ -7441,6 +7554,7 @@ def _handle_busy_submit(
                 with session["history_lock"]:
                     _record_inflight_correction(session, plain_text)
                     session["last_active"] = time.time()
+                    _publish_local_trusted_interaction(trusted_interaction)
                 return _ok(rid, {"status": "redirected"})
         except Exception:
             pass  # preserve the proven interrupt + queue fallback below
@@ -7452,7 +7566,14 @@ def _handle_busy_submit(
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        _enqueue_prompt(
+            session,
+            text,
+            transport,
+            image_paths=image_paths,
+            trusted_interaction=trusted_interaction,
+        )
+        _publish_local_trusted_interaction(trusted_interaction)
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without
@@ -7488,20 +7609,23 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             return True
     dispatch_failed = False
     try:
+        dispatch_kwargs = {
+            "queued_prompt_generation": queue_generation,
+        }
+        if queued.get("image_paths"):
+            dispatch_kwargs["image_paths"] = queued["image_paths"]
+        if queued.get("trusted_interaction") is not None:
+            dispatch_kwargs["trusted_interaction"] = queued[
+                "trusted_interaction"
+            ]
         if use_compute_host:
-            if queued.get("image_paths"):
-                resp = _submit_prompt_to_compute_host(
-                    rid,
-                    sid,
-                    session,
-                    queued["text"],
-                    image_paths=queued["image_paths"],
-                    queued_prompt_generation=queue_generation,
-                )
-            else:
-                resp = _submit_prompt_to_compute_host(
-                    rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
-                )
+            resp = _submit_prompt_to_compute_host(
+                rid,
+                sid,
+                session,
+                queued["text"],
+                **dispatch_kwargs,
+            )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
                 with session["history_lock"]:
@@ -7510,23 +7634,13 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 _emit("error", sid, {"message": message})
                 dispatch_failed = True
         else:
-            if queued.get("image_paths"):
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    queued["text"],
-                    image_paths=queued["image_paths"],
-                    queued_prompt_generation=queue_generation,
-                )
-            else:
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    queued["text"],
-                    queued_prompt_generation=queue_generation,
-                )
+            _run_prompt_submit(
+                rid,
+                sid,
+                session,
+                queued["text"],
+                **dispatch_kwargs,
+            )
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
@@ -9345,6 +9459,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    trusted_interaction=None,
 ) -> None:
     with session["history_lock"]:
         if (
@@ -9373,6 +9488,7 @@ def _run_prompt_submit(
 
     def run():
         approval_token = None
+        trusted_interaction_token = None
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         secret_token = None
@@ -9406,7 +9522,20 @@ def _run_prompt_submit(
             session_tokens = _set_session_context(
                 session["session_key"],
                 ui_session_id=sid,
+                trusted_interaction=trusted_interaction,
             )
+            if trusted_interaction is not None:
+                from agent._trusted_interaction_issuer import (
+                    _bind_trusted_interaction,
+                    _publish_trusted_interaction,
+                )
+
+                # Re-publish here as well as at acceptance: a previous turn's
+                # exact cleanup may have run before this queued envelope began.
+                _publish_trusted_interaction(trusted_interaction)
+                trusted_interaction_token = _bind_trusted_interaction(
+                    trusted_interaction
+                )
             _profile_home_str = session.get("profile_home")
             if _profile_home_str:
                 home_token = set_hermes_home_override(_profile_home_str)
@@ -10070,6 +10199,21 @@ def _run_prompt_submit(
                     reset_current_session_key(approval_token)
             except Exception:
                 pass
+            if trusted_interaction_token is not None:
+                try:
+                    from agent._trusted_interaction_issuer import (
+                        _reset_trusted_interaction,
+                    )
+
+                    _reset_trusted_interaction(trusted_interaction_token)
+                except Exception:
+                    pass
+            # End-of-turn is a hard provenance boundary. Queued prompts retain
+            # their immutable evidence and _run_prompt_submit re-publishes it
+            # at the beginning of the drained turn.
+            _clear_local_trusted_interaction(
+                session_key=str(session.get("session_key") or "") or None
+            )
             if home_token is not None:
                 reset_hermes_home_override(home_token)
             if secret_token is not None:

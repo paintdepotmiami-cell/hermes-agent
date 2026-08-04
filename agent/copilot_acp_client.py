@@ -108,7 +108,9 @@ def _build_subprocess_env() -> dict[str, str]:
     env["HOME"] = home
     from hermes_constants import apply_subprocess_home_env
     apply_subprocess_home_env(env)
-    return env
+    from private_secret_policy import scrub_private_secret_env
+
+    return scrub_private_secret_env(env)
 
 
 def _jsonrpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
