@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import inspect
 import json
+import logging
 import sys
 import threading
 import time
@@ -374,6 +375,20 @@ def _invalid_target_policy_source(target_raw_name: str) -> str:
 
     def finalize(self, request, operation, result):
         raise AssertionError("invalid target must not finalize")
+
+def register(ctx):
+    ctx.register_mcp_governor({SERVER!r}, Policy())
+'''
+
+
+def _unrecognized_violation_policy_source() -> str:
+    return f'''class Policy:
+    def prepare(self, request, services):
+        services._violation = "sk_live_abcdef"
+        return None
+
+    def finalize(self, request, operation, result):
+        raise AssertionError("blocked policy must not finalize")
 
 def register(ctx):
     ctx.register_mcp_governor({SERVER!r}, Policy())
@@ -1718,7 +1733,7 @@ def test_distinct_target_drift_blocks_after_prepare_without_target_dispatch(
     ],
 )
 def test_target_must_be_one_registered_raw_tool_on_current_server(
-    tmp_path, monkeypatch, target_kind, target_raw_name
+    tmp_path, monkeypatch, caplog, target_kind, target_raw_name
 ):
     home = tmp_path / f"home-{target_kind}"
     name = f"neutral_governor_invalid_target_{target_kind}"
@@ -1755,6 +1770,7 @@ def test_target_must_be_one_registered_raw_tool_on_current_server(
             SERVER, server, {}
         )
 
+    caplog.set_level(logging.WARNING, logger="tools.governed_mcp_dispatch")
     with _trusted_scope(platform="local"):
         result = json.loads(
             registry.dispatch(
@@ -1770,6 +1786,40 @@ def test_target_must_be_one_registered_raw_tool_on_current_server(
     assert result["preflight_count"] == 1
     assert result["dispatch_count"] == 0
     assert calls == [PREPARE]
+    assert (
+        "governed MCP violation for prepare-operation: "
+        "reason=bound operation target is not one exact registered raw tool "
+        "on the current server"
+    ) in caplog.text
+
+
+def test_unrecognized_governance_violation_reason_is_redacted(
+    tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / "home-unrecognized-violation"
+    name = "neutral_governor_unrecognized_violation"
+    _write_plugin(home, name, _unrecognized_violation_policy_source())
+    _discover_plugin(home, monkeypatch, name)
+    call_tool = AsyncMock()
+    _server_with_tools(_tool(PREPARE), call_tool=call_tool)
+
+    caplog.set_level(logging.WARNING, logger="tools.governed_mcp_dispatch")
+    with _trusted_scope(platform="local"):
+        result = json.loads(
+            registry.dispatch(
+                mcp_tool.mcp_prefixed_tool_name(SERVER, PREPARE),
+                {"value": "sentinel"},
+            )
+        )
+
+    assert result["status"] == "blocked"
+    assert result["dispatch_count"] == 0
+    call_tool.assert_not_awaited()
+    assert (
+        "governed MCP violation for prepare-operation: reason=unrecognized_reason"
+        in caplog.text
+    )
+    assert "sk_live_abcdef" not in caplog.text
 
 
 def test_plugin_policy_blocks_direct_target_invocation_without_host_classification(
@@ -3084,6 +3134,83 @@ def test_fresh_approval_failures_block_before_dispatch(
     assert result["dispatch_count"] == 0
     assert result["dispatch_started"] is False
     call_tool.assert_not_awaited()
+
+
+def test_missing_fresh_approval_notifier_logs_registered_state(
+    tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / "missing-notifier-diagnostic"
+    name = "neutral_governor_missing_notifier_diagnostic"
+    _write_plugin(home, name, _approval_policy_source())
+    _discover_plugin(home, monkeypatch, name)
+    call_tool = AsyncMock()
+    _server_with_tools(_tool(EXECUTE), call_tool=call_tool)
+    coordinator = fresh_approval.FreshApprovalCoordinator(clock=lambda: 2000.0)
+    monkeypatch.setattr(fresh_approval, "_DEFAULT_COORDINATOR", coordinator)
+
+    caplog.set_level(logging.WARNING, logger="tools.governed_mcp_dispatch")
+    with _trusted_scope(platform="local"):
+        result = json.loads(
+            registry.dispatch(
+                mcp_tool.mcp_prefixed_tool_name(SERVER, EXECUTE),
+                {"value": "sentinel"},
+            )
+        )
+
+    assert result["status"] == "blocked"
+    assert result["dispatch_count"] == 0
+    call_tool.assert_not_awaited()
+    assert (
+        "fresh approval notifier unavailable: outcome=not_registered"
+        in caplog.text
+    )
+
+
+@pytest.mark.parametrize(
+    ("exception_type", "expected_type"),
+    [
+        (AttributeError, "AttributeError"),
+        (KeyError, "KeyError"),
+        (RuntimeError, "RuntimeError"),
+        (TypeError, "TypeError"),
+        (ValueError, "ValueError"),
+        (type("sk_live_abcdef", (RuntimeError,), {}), "unrecognized_exception"),
+    ],
+)
+def test_fresh_approval_notifier_exception_logs_only_safe_type(
+    tmp_path, monkeypatch, caplog, exception_type, expected_type
+):
+    home = tmp_path / expected_type
+    name = f"neutral_governor_notifier_{expected_type.lower()}"
+    _write_plugin(home, name, _approval_policy_source())
+    _discover_plugin(home, monkeypatch, name)
+    call_tool = AsyncMock()
+    _server_with_tools(_tool(EXECUTE), call_tool=call_tool)
+    coordinator = fresh_approval.FreshApprovalCoordinator(clock=lambda: 2000.0)
+    monkeypatch.setattr(fresh_approval, "_DEFAULT_COORDINATOR", coordinator)
+
+    def failing_notifier(_data):
+        raise exception_type("sk_live_exception_message")
+
+    register_gateway_notify("neutral-desktop-session", failing_notifier)
+    caplog.set_level(logging.WARNING, logger="tools.governed_mcp_dispatch")
+    with _trusted_scope(platform="local"):
+        result = json.loads(
+            registry.dispatch(
+                mcp_tool.mcp_prefixed_tool_name(SERVER, EXECUTE),
+                {"value": "sentinel"},
+            )
+        )
+
+    assert result["status"] == "blocked"
+    assert result["dispatch_count"] == 0
+    call_tool.assert_not_awaited()
+    assert (
+        "fresh approval notifier unavailable: outcome=callback_exception "
+        f"exception_type={expected_type}"
+    ) in caplog.text
+    assert "sk_live_exception_message" not in caplog.text
+    assert "sk_live_abcdef" not in caplog.text
 
 
 @pytest.mark.parametrize(

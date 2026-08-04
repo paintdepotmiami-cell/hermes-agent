@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 from collections.abc import Mapping, Sequence
 import contextvars
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ from tools.fresh_approval import (
     InvocationSubject,
     get_fresh_approval_coordinator,
 )
+from tools.governance_violation_reasons import sanitized_violation_reason
 from tools.governed_mcp import (
     ApprovalReceipt,
     BoundOperation,
@@ -66,6 +68,18 @@ _ANNOTATION_HINTS = (
 _EMPTY_TRANSPORT_META: Mapping[str, Any] = MappingProxyType({})
 _READ_ONLY_PASS_THROUGH = object()
 logger = logging.getLogger(__name__)
+
+
+def _safe_notifier_exception_type(exc: Exception) -> str:
+    name = type(exc).__name__
+    builtin_type = getattr(builtins, name, None)
+    if (
+        isinstance(builtin_type, type)
+        and builtin_type is type(exc)
+        and issubclass(builtin_type, BaseException)
+    ):
+        return name
+    return "unrecognized_exception"
 
 
 def _approved_at_rfc3339(confirmed_at: int | float) -> str:
@@ -975,16 +989,40 @@ class _GovernedServices:
             "description": state.display_text,
             "fresh_only": True,
         }
+        notifier_failure: tuple[str, str] | None = None
         try:
             from tools.approval import notify_fresh_approval
-
-            notified = notify_fresh_approval(
-                self._request.interaction.session_key,
-                payload,
+        except Exception as exc:
+            notifier_failure = (
+                "import_exception",
+                _safe_notifier_exception_type(exc),
             )
-        except Exception:
             notified = False
+        else:
+            try:
+                notified = notify_fresh_approval(
+                    self._request.interaction.session_key,
+                    payload,
+                )
+            except Exception as exc:
+                notifier_failure = (
+                    "callback_exception",
+                    _safe_notifier_exception_type(exc),
+                )
+                notified = False
         if not notified:
+            if notifier_failure is None:
+                logger.warning(
+                    "fresh approval notifier unavailable: outcome=not_registered"
+                )
+            else:
+                outcome, exception_type = notifier_failure
+                logger.warning(
+                    "fresh approval notifier unavailable: outcome=%s "
+                    "exception_type=%s",
+                    outcome,
+                    exception_type,
+                )
             try:
                 coordinator.cancel(request.approval_id)
             except ApprovalRejected:
@@ -1222,6 +1260,12 @@ def dispatch_governed_mcp(
             breaker_action=_services_breaker_action(services),
         )
     if prepare_error is not None or services.violation is not None:
+        if services.violation is not None:
+            logger.warning(
+                "governed MCP violation for %s: reason=%s",
+                descriptor.raw_tool_name,
+                sanitized_violation_reason(services.violation),
+            )
         return _audit_json(
             descriptor=descriptor,
             status="blocked",
