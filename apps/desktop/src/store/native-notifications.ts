@@ -200,9 +200,9 @@ export async function respondToApprovalAction(sessionId: null | string, actionId
 
   try {
     const pending = sessionApprovalRequest(sessionId).get()
-    const params = pending
-      ? approvalRespondParams(pending, choice)
-      : { choice, session_id: sessionId ?? undefined }
+
+    const params = pending ? approvalRespondParams(pending, choice) : { choice, session_id: sessionId ?? undefined }
+
     await gateway.request('approval.respond', params)
     clearApprovalRequest(sessionId)
   } catch {

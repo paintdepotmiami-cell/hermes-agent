@@ -143,10 +143,7 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
       setSubmitting(choice)
 
       try {
-        await gateway.request<{ resolved?: boolean }>(
-          'approval.respond',
-          approvalRespondParams(request, choice)
-        )
+        await gateway.request<{ resolved?: boolean }>('approval.respond', approvalRespondParams(request, choice))
         triggerHaptic(choice === 'deny' ? 'cancel' : 'submit')
         clearApprovalRequest(request.sessionId)
       } catch (error) {

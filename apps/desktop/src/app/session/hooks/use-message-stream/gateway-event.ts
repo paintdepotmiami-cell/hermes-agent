@@ -924,10 +924,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         const description = typeof payload?.description === 'string' ? payload.description : 'dangerous command'
 
         setApprovalRequest({
-          approvalId:
-            typeof payload?.approval_id === 'string' && payload.approval_id
-              ? payload.approval_id
-              : undefined,
+          approvalId: typeof payload?.approval_id === 'string' && payload.approval_id ? payload.approval_id : undefined,
           // false only when a tirith warning forbids it; backend omits the field otherwise.
           allowPermanent: payload?.allow_permanent !== false,
           choices: Array.isArray(payload?.choices)
