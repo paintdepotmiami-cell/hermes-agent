@@ -123,6 +123,42 @@ class TestMcpList:
         assert "enabled" in out
 
 
+class TestMcpClientCredentials:
+    def test_reauth_validates_m2m_without_browser_or_token_file(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        from hermes_cli.mcp_config import _reauth_oauth_server
+
+        class _Manager:
+            evicted = None
+
+            def evict(self, name):
+                self.evicted = name
+
+        manager = _Manager()
+        monkeypatch.setattr(
+            "tools.mcp_oauth_manager.get_manager", lambda: manager
+        )
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda name, config: [("dps_tool", "")],
+        )
+
+        result = _reauth_oauth_server(
+            "dps-work",
+            {
+                "url": "https://dps-work.example/mcp",
+                "auth": "oauth",
+                "oauth": {"grant_type": "client_credentials"},
+            },
+        )
+
+        assert result is True
+        assert manager.evicted == "dps-work"
+        assert "M2M authenticated" in capsys.readouterr().out
+        assert not (tmp_path / "mcp-tokens").exists()
+
+
 # ---------------------------------------------------------------------------
 # Tests: cmd_mcp_remove
 # ---------------------------------------------------------------------------

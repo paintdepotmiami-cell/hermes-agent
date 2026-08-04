@@ -2780,9 +2780,9 @@ class MCPServerTask:
         ssl_verify = config.get("ssl_verify", True)
         client_cert = _resolve_client_cert(self.name, config)
 
-        # OAuth 2.1 PKCE: route through the central MCPOAuthManager so the
-        # same provider instance is reused across reconnects, pre-flow
-        # disk-watch is active, and config-time CLI code paths share state.
+        # OAuth: route browser PKCE and autonomous client-credentials flows
+        # through the central MCPOAuthManager so the provider is reused across
+        # reconnects and config-time CLI code paths share state.
         # If OAuth setup fails (e.g. non-interactive env without cached
         # tokens), re-raise so this server is reported as failed without
         # blocking other MCP servers from connecting.
@@ -4889,6 +4889,8 @@ def _make_tool_handler(
         # plugin load/force-reload never requires rebuilding the model tool
         # schema. Their handler snapshot, however, is discovery-owned: session
         # swaps or metadata drift must block instead of silently retargeting.
+        from tools.governed_mcp_dispatch import _GovernanceViolation
+
         try:
             from hermes_cli.plugins import get_mcp_governor
 
@@ -4949,7 +4951,6 @@ def _make_tool_handler(
                 )
             from tools.governed_mcp_dispatch import (
                 _READ_ONLY_PASS_THROUGH,
-                _GovernanceViolation,
                 _audit_json,
                 _target_is_current,
                 dispatch_governed_mcp,
