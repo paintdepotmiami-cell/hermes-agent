@@ -25,6 +25,7 @@ from tools.fresh_approval import (
     InvocationSubject,
     get_fresh_approval_coordinator,
 )
+from tools.governance_violation_reasons import sanitized_violation_reason
 from tools.governed_mcp import (
     ApprovalReceipt,
     BoundOperation,
@@ -1222,6 +1223,12 @@ def dispatch_governed_mcp(
             breaker_action=_services_breaker_action(services),
         )
     if prepare_error is not None or services.violation is not None:
+        if services.violation is not None:
+            logger.warning(
+                "governed MCP violation for %s: reason=%s",
+                descriptor.raw_tool_name,
+                sanitized_violation_reason(services.violation),
+            )
         return _audit_json(
             descriptor=descriptor,
             status="blocked",
