@@ -58,6 +58,15 @@ _FRESH_APPROVAL_TTL_SECONDS = 300.0
 _BREAKER_ACTION_IGNORE = "ignore"
 _BREAKER_ACTION_BUMP = "bump"
 _BREAKER_ACTION_RESET = "reset"
+_SAFE_NOTIFIER_EXCEPTION_TYPES = frozenset(
+    {
+        "ConnectionError",
+        "ImportError",
+        "OSError",
+        "RuntimeError",
+        "TimeoutError",
+    }
+)
 _ANNOTATION_HINTS = (
     "readOnlyHint",
     "destructiveHint",
@@ -67,6 +76,13 @@ _ANNOTATION_HINTS = (
 _EMPTY_TRANSPORT_META: Mapping[str, Any] = MappingProxyType({})
 _READ_ONLY_PASS_THROUGH = object()
 logger = logging.getLogger(__name__)
+
+
+def _safe_notifier_exception_type(exc: Exception) -> str:
+    name = type(exc).__name__
+    if name in _SAFE_NOTIFIER_EXCEPTION_TYPES:
+        return name
+    return "unrecognized_exception"
 
 
 def _approved_at_rfc3339(confirmed_at: int | float) -> str:
@@ -976,16 +992,40 @@ class _GovernedServices:
             "description": state.display_text,
             "fresh_only": True,
         }
+        notifier_failure: tuple[str, str] | None = None
         try:
             from tools.approval import notify_fresh_approval
-
-            notified = notify_fresh_approval(
-                self._request.interaction.session_key,
-                payload,
+        except Exception as exc:
+            notifier_failure = (
+                "import_exception",
+                _safe_notifier_exception_type(exc),
             )
-        except Exception:
             notified = False
+        else:
+            try:
+                notified = notify_fresh_approval(
+                    self._request.interaction.session_key,
+                    payload,
+                )
+            except Exception as exc:
+                notifier_failure = (
+                    "callback_exception",
+                    _safe_notifier_exception_type(exc),
+                )
+                notified = False
         if not notified:
+            if notifier_failure is None:
+                logger.warning(
+                    "fresh approval notifier unavailable: outcome=not_registered"
+                )
+            else:
+                outcome, exception_type = notifier_failure
+                logger.warning(
+                    "fresh approval notifier unavailable: outcome=%s "
+                    "exception_type=%s",
+                    outcome,
+                    exception_type,
+                )
             try:
                 coordinator.cancel(request.approval_id)
             except ApprovalRejected:

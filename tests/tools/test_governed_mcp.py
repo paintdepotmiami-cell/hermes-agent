@@ -3136,6 +3136,79 @@ def test_fresh_approval_failures_block_before_dispatch(
     call_tool.assert_not_awaited()
 
 
+def test_missing_fresh_approval_notifier_logs_registered_state(
+    tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / "missing-notifier-diagnostic"
+    name = "neutral_governor_missing_notifier_diagnostic"
+    _write_plugin(home, name, _approval_policy_source())
+    _discover_plugin(home, monkeypatch, name)
+    call_tool = AsyncMock()
+    _server_with_tools(_tool(EXECUTE), call_tool=call_tool)
+    coordinator = fresh_approval.FreshApprovalCoordinator(clock=lambda: 2000.0)
+    monkeypatch.setattr(fresh_approval, "_DEFAULT_COORDINATOR", coordinator)
+
+    caplog.set_level(logging.WARNING, logger="tools.governed_mcp_dispatch")
+    with _trusted_scope(platform="local"):
+        result = json.loads(
+            registry.dispatch(
+                mcp_tool.mcp_prefixed_tool_name(SERVER, EXECUTE),
+                {"value": "sentinel"},
+            )
+        )
+
+    assert result["status"] == "blocked"
+    assert result["dispatch_count"] == 0
+    call_tool.assert_not_awaited()
+    assert (
+        "fresh approval notifier unavailable: outcome=not_registered"
+        in caplog.text
+    )
+
+
+@pytest.mark.parametrize(
+    ("exception_type", "expected_type"),
+    [
+        (RuntimeError, "RuntimeError"),
+        (type("sk_live_abcdef", (RuntimeError,), {}), "unrecognized_exception"),
+    ],
+)
+def test_fresh_approval_notifier_exception_logs_only_safe_type(
+    tmp_path, monkeypatch, caplog, exception_type, expected_type
+):
+    home = tmp_path / expected_type
+    name = f"neutral_governor_notifier_{expected_type.lower()}"
+    _write_plugin(home, name, _approval_policy_source())
+    _discover_plugin(home, monkeypatch, name)
+    call_tool = AsyncMock()
+    _server_with_tools(_tool(EXECUTE), call_tool=call_tool)
+    coordinator = fresh_approval.FreshApprovalCoordinator(clock=lambda: 2000.0)
+    monkeypatch.setattr(fresh_approval, "_DEFAULT_COORDINATOR", coordinator)
+
+    def failing_notifier(_data):
+        raise exception_type("sk_live_exception_message")
+
+    register_gateway_notify("neutral-desktop-session", failing_notifier)
+    caplog.set_level(logging.WARNING, logger="tools.governed_mcp_dispatch")
+    with _trusted_scope(platform="local"):
+        result = json.loads(
+            registry.dispatch(
+                mcp_tool.mcp_prefixed_tool_name(SERVER, EXECUTE),
+                {"value": "sentinel"},
+            )
+        )
+
+    assert result["status"] == "blocked"
+    assert result["dispatch_count"] == 0
+    call_tool.assert_not_awaited()
+    assert (
+        "fresh approval notifier unavailable: outcome=callback_exception "
+        f"exception_type={expected_type}"
+    ) in caplog.text
+    assert "sk_live_exception_message" not in caplog.text
+    assert "sk_live_abcdef" not in caplog.text
+
+
 @pytest.mark.parametrize(
     (
         "case_name",
