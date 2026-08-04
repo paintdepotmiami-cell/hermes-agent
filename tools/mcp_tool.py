@@ -4889,6 +4889,8 @@ def _make_tool_handler(
         # plugin load/force-reload never requires rebuilding the model tool
         # schema. Their handler snapshot, however, is discovery-owned: session
         # swaps or metadata drift must block instead of silently retargeting.
+        from tools.governed_mcp_dispatch import _GovernanceViolation
+
         try:
             from hermes_cli.plugins import get_mcp_governor
 
@@ -4949,7 +4951,6 @@ def _make_tool_handler(
                 )
             from tools.governed_mcp_dispatch import (
                 _READ_ONLY_PASS_THROUGH,
-                _GovernanceViolation,
                 _audit_json,
                 _target_is_current,
                 dispatch_governed_mcp,
