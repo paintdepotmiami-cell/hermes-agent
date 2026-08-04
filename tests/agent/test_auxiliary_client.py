@@ -989,6 +989,93 @@ class TestExplicitProviderRouting:
         assert mock_openai.call_args.kwargs["base_url"] == OPENROUTER_BASE_URL
 
 
+class TestOpenRouterPaidLaneGuard:
+    """Issue #75803: auxiliary auto-chain OpenRouter fallback must be
+    configurable and never silently engage a PAID model."""
+
+    def test_free_only_skips_paid_default_model(self, monkeypatch):
+        """free_only=true + default (paid) model → OpenRouter skipped."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly", return_value={"auxiliary": {"free_only": True}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            client, model = _try_openrouter()
+        assert client is None
+        assert model is None
+        mock_openai.assert_not_called()
+
+    def test_free_only_allows_free_model(self, monkeypatch):
+        """free_only=true + :free model → OpenRouter used with that model."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly",
+                   return_value={"auxiliary": {"free_only": True,
+                                              "openrouter_model": "nvidia/nemotron-3-ultra-550b-a55b:free"}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_client = MagicMock(name="openrouter_client")
+            mock_openai.return_value = mock_client
+            client, model = _try_openrouter()
+        assert client is mock_client
+        assert model == "nvidia/nemotron-3-ultra-550b-a55b:free"
+
+    def test_configured_model_overrides_hardcoded_default(self, monkeypatch):
+        """auxiliary.openrouter_model replaces _OPENROUTER_MODEL."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly",
+                   return_value={"auxiliary": {"openrouter_model": "some/vendor-model"}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_client = MagicMock(name="openrouter_client")
+            mock_openai.return_value = mock_client
+            client, model = _try_openrouter()
+        assert client is mock_client
+        assert model == "some/vendor-model"
+
+    def test_explicit_caller_model_respects_free_only(self, monkeypatch):
+        """Auxiliary.<task>.model (explicit) is also gated by free_only."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly", return_value={"auxiliary": {"free_only": True}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            client, model = _try_openrouter(model="google/gemini-3.6-flash")
+        assert client is None
+        assert model is None
+        mock_openai.assert_not_called()
+
+    def test_paid_lane_warns_once(self, monkeypatch, caplog):
+        """Engaging the default paid model logs a WARNING (once per model)."""
+        import logging
+        from agent.auxiliary_client import _paid_lane_warned
+        _paid_lane_warned.discard(_OPENROUTER_MODEL)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly", return_value={"auxiliary": {}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_client = MagicMock(name="openrouter_client")
+            mock_openai.return_value = mock_client
+            with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+                client, model = _try_openrouter()
+        assert client is mock_client
+        assert model == _OPENROUTER_MODEL
+        assert any("PAID lane engaged" in r.getMessage() for r in caplog.records)
+        # Second call logs nothing new.
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly", return_value={"auxiliary": {}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+                _try_openrouter()
+        assert not any("PAID lane engaged" in r.getMessage() for r in caplog.records)
+        _paid_lane_warned.discard(_OPENROUTER_MODEL)
+
+    def test_is_free_model(self):
+        from agent.auxiliary_client import _is_free_model
+        assert _is_free_model("nvidia/nemotron-3-ultra-550b-a55b:free")
+        assert not _is_free_model("google/gemini-3.6-flash")
+        assert not _is_free_model("")
+        assert not _is_free_model(None)
+
+
 class TestGetTextAuxiliaryClient:
     """Test the full resolution chain for get_text_auxiliary_client."""
 
@@ -4213,3 +4300,66 @@ class TestSynchronousFallbackCachePlans:
             for part in (message.get("content") if isinstance(message.get("content"), list) else [])
         )
 
+
+
+class TestAsynchronousFallbackCachePlans:
+    @pytest.mark.asyncio
+    async def test_async_fallback_replans_cache_sections_like_sync(self, monkeypatch):
+        """Async mirror parity: per-destination cache replan, not verbatim pass-through."""
+        from agent.auxiliary_client import (
+            _call_fallback_candidate_async,
+            _try_configured_fallback_chain,
+        )
+
+        entry = {
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "base_url": "https://api.anthropic.com",
+            "api_mode": "anthropic_messages",
+        }
+        client = MagicMock()
+        client.base_url = entry["base_url"]
+
+        async def _create(**kwargs):
+            return _DummyResponse()
+
+        client.chat.completions.create = MagicMock(side_effect=_create)
+        monkeypatch.setattr(
+            "agent.auxiliary_client.resolve_provider_client",
+            lambda provider, model=None, **kwargs: (client, model),
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"fallback_chain": [entry]},
+        )
+        fallback_client, fallback_model, label = _try_configured_fallback_chain(
+            task="moa_aggregator",
+            failed_provider="primary",
+        )
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }]
+        await _call_fallback_candidate_async(
+            fallback_client,
+            fallback_model,
+            label,
+            task="moa_aggregator",
+            messages=[
+                {"role": "system", "content": "stable prefix"},
+                {"role": "user", "content": "lookup"},
+            ],
+            temperature=None,
+            max_tokens=None,
+            tools=tools,
+            effective_timeout=30.0,
+            effective_extra_body={},
+            reasoning_config=None,
+        )
+
+        wire_tools = client.chat.completions.create.call_args.kwargs["tools"]
+        assert "cache_control" in wire_tools[-1]
+        assert "cache_control" not in tools[-1]

@@ -34,6 +34,7 @@ so plugin-defined tools appear alongside the built-in tools.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import importlib.metadata
 import importlib.util
 import inspect
@@ -44,9 +45,16 @@ import threading
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Union
 
 from hermes_constants import get_hermes_home
+from private_secret_policy import (
+    PrivateSecretPolicyError,
+    prepare_private_secret_names,
+    replace_private_secret_names,
+    restore_private_secret_policy,
+    snapshot_private_secret_policy,
+)
 from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
@@ -64,6 +72,8 @@ def get_bundled_plugins_dir() -> Path:
         return Path(env_override)
     return Path(__file__).resolve().parent.parent / "plugins"
 
+from registry_transaction import RegistryTransactionConflict
+
 try:
     import yaml
 except ImportError:  # pragma: no cover – yaml is optional at import time
@@ -74,6 +84,10 @@ class PluginToolOverrideError(PermissionError):
     """Raised when a plugin attempts to override a built-in tool without
     operator opt-in via ``plugins.entries.<plugin_id>.allow_tool_override``.
     """
+
+
+class MCPGovernanceRegistrationError(PermissionError):
+    """Raised when a plugin cannot claim one exact MCP server safely."""
 
 
 logger = logging.getLogger(__name__)
@@ -219,6 +233,72 @@ ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 _NS_PARENT = "hermes_plugins"
 
 
+def _snapshot_module_namespace(root: str) -> Dict[str, types.ModuleType]:
+    """Capture module identities for *root* and all descendants."""
+    prefix = f"{root}."
+    return {
+        name: module
+        for name, module in sys.modules.items()
+        if name == root or name.startswith(prefix)
+    }
+
+
+def _restore_module_namespace(
+    root: str,
+    snapshot: Dict[str, types.ModuleType],
+) -> None:
+    """Remove modules created in an attempt, then restore prior identities."""
+    prefix = f"{root}."
+    for name in list(sys.modules):
+        if name == root or name.startswith(prefix):
+            sys.modules.pop(name, None)
+    sys.modules.update(snapshot)
+
+
+def _directory_module_name(manifest: "PluginManifest") -> str:
+    key = manifest.key or manifest.name
+    slug = key.replace("/", "__").replace("-", "_")
+    return f"{_NS_PARENT}.{slug}"
+
+
+_PROVIDER_REGISTRY_MODULES = {
+    "image_gen": "agent.image_gen_registry",
+    "video_gen": "agent.video_gen_registry",
+    "web": "agent.web_search_registry",
+    "browser": "agent.browser_registry",
+    "tts": "agent.tts_registry",
+    "stt": "agent.transcription_registry",
+    "dashboard": "hermes_cli.dashboard_auth.registry",
+}
+_EXTERNAL_COMMIT_SURFACES = (
+    "platform",
+    "browser",
+    "dashboard",
+    "image_gen",
+    "secret",
+    "stt",
+    "tts",
+    "video_gen",
+    "web",
+)
+
+
+def _external_registry_transactions() -> Dict[str, Any]:
+    """Return opaque registry-owned transaction surfaces in commit order."""
+    from gateway.platform_registry import platform_registry
+
+    transactions: Dict[str, Any] = {"platform": platform_registry}
+    for surface in _EXTERNAL_COMMIT_SURFACES[1:]:
+        module_name = (
+            "agent.secret_sources.registry"
+            if surface == "secret"
+            else _PROVIDER_REGISTRY_MODULES[surface]
+        )
+        module = importlib.import_module(module_name)
+        transactions[surface] = module._plugin_transaction
+    return transactions
+
+
 def _env_enabled(name: str) -> bool:
     """Return True when an env var is set to a truthy opt-in value."""
     return env_var_enabled(name)
@@ -314,6 +394,16 @@ class PluginManifest:
     key: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class MCPGovernorRegistration:
+    """Immutable manager-owned attribution for one exact server claim."""
+
+    server_name: str
+    plugin_id: str
+    policy: Any = field(repr=False, compare=False)
+    secret_env_names: frozenset[str] = field(default_factory=frozenset)
+
+
 @dataclass
 class LoadedPlugin:
     """Runtime state for a single loaded plugin."""
@@ -324,6 +414,7 @@ class LoadedPlugin:
     hooks_registered: List[str] = field(default_factory=list)
     middleware_registered: List[str] = field(default_factory=list)
     commands_registered: List[str] = field(default_factory=list)
+    mcp_governors_registered: List[str] = field(default_factory=list)
     enabled: bool = False
     error: Optional[str] = None
     # True for a bundled platform plugin recorded as a deferred (not-yet-
@@ -332,19 +423,656 @@ class LoadedPlugin:
     deferred: bool = False
 
 
+def _manifest_private_secret_names(
+    manifest: PluginManifest,
+) -> frozenset[str]:
+    """Return validated private env names declared by one active manifest.
+
+    Bare-string ``requires_env`` entries and rich entries without
+    ``secret: true`` retain their existing setup semantics but do not become
+    host-private names.  A malformed attempt to declare a private name raises
+    a sanitized typed error without echoing manifest content.
+    """
+    raw_entries = manifest.requires_env
+    if raw_entries is None:
+        return frozenset()
+    if not isinstance(raw_entries, (list, tuple)):
+        if isinstance(raw_entries, dict) and "secret" in raw_entries:
+            raise PrivateSecretPolicyError(
+                "invalid plugin private-secret declaration"
+            )
+        return frozenset()
+
+    declared: list[object] = []
+    for entry in raw_entries:
+        if not isinstance(entry, dict):
+            continue
+        secret_marker = entry.get("secret", False)
+        if secret_marker is False or secret_marker is None:
+            continue
+        if secret_marker is not True:
+            raise PrivateSecretPolicyError(
+                "invalid plugin private-secret declaration"
+            )
+        declared.append(entry.get("name"))
+    return prepare_private_secret_names(declared)
+
+
+def _manifest_is_active_for_general_discovery(
+    manifest: PluginManifest,
+    disabled: set,
+    enabled: Optional[set],
+) -> bool:
+    """Match the general loader's activation rules without importing code."""
+    lookup_key = manifest.key or manifest.name
+    if lookup_key in disabled or manifest.name in disabled:
+        return False
+    if manifest.kind in {"exclusive", "model-provider"}:
+        return False
+    if manifest.source == "bundled" and manifest.kind in {"backend", "platform"}:
+        return True
+    return enabled is not None and (
+        lookup_key in enabled or manifest.name in enabled
+    )
+
+
+class _PluginManagerState:
+    """Host-private, identity-preserving snapshot of manager-owned state."""
+
+    def __init__(self, manager: "PluginManager") -> None:
+        self._plugins = dict(manager._plugins)
+        self._hooks = {
+            name: list(callbacks) for name, callbacks in manager._hooks.items()
+        }
+        self._middleware = {
+            name: list(callbacks)
+            for name, callbacks in manager._middleware.items()
+        }
+        self._plugin_tool_names = set(manager._plugin_tool_names)
+        self._plugin_platform_names = set(manager._plugin_platform_names)
+        self._plugin_external_names = {
+            surface: set(names)
+            for surface, names in manager._plugin_external_names.items()
+        }
+        self._cli_commands = {
+            name: dict(entry) for name, entry in manager._cli_commands.items()
+        }
+        self._context_engine = manager._context_engine
+        self._plugin_commands = {
+            name: dict(entry) for name, entry in manager._plugin_commands.items()
+        }
+        self._plugin_skills = {
+            name: dict(entry) for name, entry in manager._plugin_skills.items()
+        }
+        self._aux_tasks = {
+            name: {
+                **entry,
+                "defaults": dict(entry.get("defaults", {})),
+            }
+            for name, entry in manager._aux_tasks.items()
+        }
+        self._slack_action_handlers = list(manager._slack_action_handlers)
+        self._mcp_governors = dict(manager._mcp_governors)
+        self._discovered = manager._discovered
+        self._generation = manager._generation
+        self._live_context_generation = manager._live_context_generation
+
+
+class _PluginRegistrationView:
+    """Isolated manager facade populated while arbitrary plugin code runs."""
+
+    def __init__(
+        self,
+        state: _PluginManagerState,
+        cli_ref: Any,
+    ) -> None:
+        # Clone every list/dict again: the rollback checkpoint and staging view
+        # must never alias one another.
+        self._plugins = dict(state._plugins)
+        self._hooks = {
+            name: list(callbacks) for name, callbacks in state._hooks.items()
+        }
+        self._middleware = {
+            name: list(callbacks)
+            for name, callbacks in state._middleware.items()
+        }
+        self._plugin_tool_names = set(state._plugin_tool_names)
+        self._plugin_platform_names = set(state._plugin_platform_names)
+        self._plugin_external_names = {
+            surface: set(names)
+            for surface, names in state._plugin_external_names.items()
+        }
+        self._cli_commands = {
+            name: dict(entry) for name, entry in state._cli_commands.items()
+        }
+        self._context_engine = state._context_engine
+        self._plugin_commands = {
+            name: dict(entry) for name, entry in state._plugin_commands.items()
+        }
+        self._plugin_skills = {
+            name: dict(entry) for name, entry in state._plugin_skills.items()
+        }
+        self._aux_tasks = {
+            name: {
+                **entry,
+                "defaults": dict(entry.get("defaults", {})),
+            }
+            for name, entry in state._aux_tasks.items()
+        }
+        self._slack_action_handlers = list(state._slack_action_handlers)
+        self._mcp_governors = dict(state._mcp_governors)
+        self._discovered = state._discovered
+        self._generation = state._generation
+        self._live_context_generation = state._live_context_generation
+        self._cli_ref = cli_ref
+        self._lock = threading.RLock()
+        self._transaction_tools_registered: List[str] = []
+        self._transaction_commands_registered: List[str] = []
+        self._transaction_mcp_governors_registered: List[str] = []
+        self._frozen = False
+
+    def _record_external_registration(self, surface: str, name: str) -> None:
+        self._plugin_external_names.setdefault(surface, set()).add(name)
+        if surface == "platform":
+            self._plugin_platform_names.add(name)
+        self._generation += 1
+
+    def _freeze(self) -> None:
+        """Make every staged manager container reject late registrations."""
+        self._plugins = types.MappingProxyType(dict(self._plugins))
+        self._hooks = types.MappingProxyType(
+            {name: tuple(callbacks) for name, callbacks in self._hooks.items()}
+        )
+        self._middleware = types.MappingProxyType(
+            {
+                name: tuple(callbacks)
+                for name, callbacks in self._middleware.items()
+            }
+        )
+        self._plugin_tool_names = frozenset(self._plugin_tool_names)
+        self._plugin_platform_names = frozenset(self._plugin_platform_names)
+        self._plugin_external_names = types.MappingProxyType(
+            {
+                surface: frozenset(names)
+                for surface, names in self._plugin_external_names.items()
+            }
+        )
+        self._cli_commands = types.MappingProxyType(dict(self._cli_commands))
+        self._plugin_commands = types.MappingProxyType(dict(self._plugin_commands))
+        self._plugin_skills = types.MappingProxyType(dict(self._plugin_skills))
+        self._aux_tasks = types.MappingProxyType(dict(self._aux_tasks))
+        self._slack_action_handlers = tuple(self._slack_action_handlers)
+        self._mcp_governors = types.MappingProxyType(dict(self._mcp_governors))
+        self._frozen = True
+
+
+class _PluginPublicationCapability:
+    """Host-owned, fail-closed authority for one managed publication."""
+
+    __slots__ = ("_published",)
+
+    def __init__(self) -> None:
+        object.__setattr__(self, "_published", False)
+
+    def _activate(self) -> None:
+        # This is the final, non-failing publication point. Bypass plugin-
+        # controlled attribute hooks so activation can never be ambiguous.
+        object.__setattr__(self, "_published", True)
+
+
+def _run_cleanup_actions(
+    actions: Iterable[tuple[str, Callable[[], None]]],
+    *,
+    primary: Optional[BaseException] = None,
+    note: str = "Plugin registration cleanup failed",
+) -> None:
+    """Run every cleanup action, preserving an active primary exception."""
+    failures: List[tuple[str, BaseException]] = []
+    for label, action in actions:
+        try:
+            action()
+        except BaseException as exc:
+            logger.error("%s for %s", note, label, exc_info=True)
+            failures.append((label, exc))
+    if not failures:
+        return
+    if primary is not None:
+        primary.add_note(
+            f"{note}; attempted all cleanup actions. First failure: "
+            f"{failures[0][0]}: {type(failures[0][1]).__name__}: {failures[0][1]}"
+        )
+        for label, exc in failures[1:]:
+            primary.add_note(
+                f"Additional cleanup failure: {label}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        return
+    first_label, first_failure = failures[0]
+    for label, exc in failures[1:]:
+        first_failure.add_note(
+            f"Additional cleanup failure: {label}: {type(exc).__name__}: {exc}"
+        )
+    first_failure.add_note(
+        f"{note}; attempted all cleanup actions. First failure at {first_label}."
+    )
+    raise first_failure
+
+
+@dataclass(frozen=True)
+class _PluginContextBinding:
+    """One coherent authority target captured by a registration mutation."""
+
+    registry: Any
+    manager: Any
+    external_registries: Any
+    managed_generation: Optional[int]
+    publication_capability: Optional[_PluginPublicationCapability] = None
+
+
+class _RegistrationTransaction:
+    """One isolated plugin registration or complete force-reload candidate."""
+
+    def __init__(
+        self,
+        manager: "PluginManager",
+        *,
+        replace_owned: bool = False,
+    ) -> None:
+        from tools.registry import registry as tool_registry
+
+        self.manager = manager
+        self.replace_owned = replace_owned
+        self.tool_registry = tool_registry
+        self.registration_lock = threading.RLock()
+        self.external_transactions = _external_registry_transactions()
+        locks = [
+            manager._lock,
+            tool_registry._lock,
+            *(
+                self.external_transactions[surface].lock
+                for surface in _EXTERNAL_COMMIT_SURFACES
+            ),
+        ]
+        acquired_locks: List[Any] = []
+        try:
+            for lock in locks:
+                lock.acquire()
+                acquired_locks.append(lock)
+            self.manager_before = _PluginManagerState(manager)
+            self.tool_snapshot = tool_registry._take_transaction_snapshot()
+            self.external_snapshots = {
+                surface: self.external_transactions[surface].take_snapshot()
+                for surface in _EXTERNAL_COMMIT_SURFACES
+            }
+        finally:
+            _run_cleanup_actions(
+                [
+                    (f"constructor lock[{index}]", lock.release)
+                    for index, lock in enumerate(reversed(acquired_locks))
+                ],
+                primary=sys.exc_info()[1],
+            )
+
+        self.manager_view = _PluginRegistrationView(
+            self.manager_before,
+            manager._cli_ref,
+        )
+        if replace_owned:
+            self.manager_view._plugins = {}
+            self.manager_view._hooks = {}
+            self.manager_view._middleware = {}
+            self.manager_view._plugin_tool_names = set()
+            self.manager_view._plugin_platform_names = set()
+            self.manager_view._plugin_external_names = {
+                surface: set() for surface in _EXTERNAL_COMMIT_SURFACES
+            }
+            self.manager_view._cli_commands = {}
+            self.manager_view._context_engine = None
+            self.manager_view._plugin_commands = {}
+            self.manager_view._plugin_skills = {}
+            self.manager_view._aux_tasks = {}
+            self.manager_view._slack_action_handlers = []
+            self.manager_view._mcp_governors = {}
+        self.manager_view._discovered = True
+
+        removed_tool_names = (
+            self.manager_before._plugin_tool_names if replace_owned else set()
+        )
+        removed_policy_names = set()
+        if replace_owned:
+            for loaded in self.manager_before._plugins.values():
+                manifest = loaded.manifest
+                plugin_id = manifest.key or manifest.name
+                if manifest.source in {"user", "project", "bundled"}:
+                    removed_policy_names.add(_directory_module_name(manifest))
+                else:
+                    removed_policy_names.add(plugin_id)
+        self.tool_view = tool_registry._create_transaction_view(
+            self.tool_snapshot,
+            remove_names=removed_tool_names,
+            remove_policy_names=removed_policy_names,
+        )
+
+        self.external_views = {}
+        for surface, transaction in self.external_transactions.items():
+            remove_keys = (
+                self.manager_before._plugin_external_names.get(surface, set())
+                if replace_owned
+                else set()
+            )
+            self.external_views[surface] = transaction.create_view(
+                self.external_snapshots[surface],
+                remove_keys=remove_keys,
+            )
+        self.contexts: List["PluginContext"] = []
+        self.context_generation = (
+            self.manager_before._live_context_generation + 1
+            if replace_owned
+            else self.manager_before._live_context_generation
+        )
+
+    def context_targets(self) -> Dict[str, tuple[Any, Any]]:
+        return {
+            surface: (transaction, self.external_views[surface])
+            for surface, transaction in self.external_transactions.items()
+        }
+
+    def commit(self) -> None:
+        """Validate every baseline, then install all surfaces under one lock set."""
+        prepared_tools = self.tool_registry._prepare_transaction_commit(
+            self.tool_snapshot,
+            self.tool_view,
+        )
+        prepared_external = {
+            surface: transaction.prepare(
+                self.external_snapshots[surface],
+                self.external_views[surface],
+            )
+            for surface, transaction in self.external_transactions.items()
+        }
+        with self.manager_view._lock:
+            self.manager_view._live_context_generation = self.context_generation
+            next_manager = _PluginManagerState(self.manager_view)
+            self.manager_view._freeze()
+
+        revoke_generation = (
+            self.manager_before._live_context_generation
+            if self.replace_owned
+            else None
+        )
+        context_locks = [self.manager._context_registration_lock]
+        context_locks.extend(
+            dict.fromkeys(context._registration_lock for context in self.contexts)
+        )
+        live_registry_locks = [
+            self.manager._lock,
+            self.tool_registry._lock,
+            *(
+                self.external_transactions[surface].lock
+                for surface in _EXTERNAL_COMMIT_SURFACES
+            ),
+        ]
+        acquired_locks: List[Any] = []
+        revocation_started = False
+        publication_started = False
+        publication_capability = _PluginPublicationCapability()
+        context_bindings_before: List[
+            tuple[PluginContext, _PluginContextBinding]
+        ] = []
+        active_primary: Optional[BaseException] = None
+
+        try:
+            # Binding locks always precede every live manager/tool/external
+            # registry lock. This blocks retained contexts before publication
+            # can swap or restore their single coherent authority reference.
+            for lock in context_locks:
+                # A registration callback may wait for this commit thread.
+                # Never wait back while it owns the shared context lock: abort
+                # this candidate and let the live registration complete.
+                if not lock.acquire(blocking=False):
+                    raise _ForceSweepAbort(
+                        "plugin publication conflicted with an active registration"
+                    )
+                acquired_locks.append(lock)
+            if revoke_generation is not None:
+                # Claim cleanup before the call: an injected BaseException may
+                # occur after the manager adds the marker but before returning.
+                revocation_started = True
+                self.manager._begin_live_context_revocation(revoke_generation)
+            for lock in live_registry_locks:
+                lock.acquire()
+                acquired_locks.append(lock)
+
+            context_bindings_before = [
+                (context, context._registration_binding)
+                for context in self.contexts
+            ]
+            if self.manager._generation != self.manager_before._generation:
+                raise RegistryTransactionConflict(
+                    "manager",
+                    self.manager_before._generation,
+                    self.manager._generation,
+                )
+            self.tool_registry._validate_prepared_transaction_locked(
+                self.tool_snapshot,
+                prepared_tools,
+            )
+            for surface in _EXTERNAL_COMMIT_SURFACES:
+                transaction = self.external_transactions[surface]
+                transaction.validate_prepared_locked(
+                    self.external_snapshots[surface],
+                    prepared_external[surface],
+                )
+
+            publication_started = True
+            self.tool_registry._install_prepared_transaction_locked(
+                self.tool_snapshot,
+                prepared_tools,
+            )
+            for surface in _EXTERNAL_COMMIT_SURFACES:
+                transaction = self.external_transactions[surface]
+                transaction.install_prepared_locked(
+                    self.external_snapshots[surface],
+                    prepared_external[surface],
+                )
+            for context in self.contexts:
+                context._registration_binding = _PluginContextBinding(
+                    registry=self.tool_registry,
+                    manager=self.manager,
+                    external_registries=None,
+                    managed_generation=self.context_generation,
+                    publication_capability=publication_capability,
+                )
+            self.manager._install_owned_state_locked(next_manager)
+            publication_capability._activate()
+        except BaseException as primary:
+            active_primary = primary
+            if publication_started and not publication_capability._published:
+                rollback_errors: List[BaseException] = []
+                rollback_steps = [
+                    (
+                        "tool",
+                        lambda: self.tool_registry._restore_transaction_snapshot_exact_locked(
+                            self.tool_snapshot,
+                        ),
+                    ),
+                    *(
+                        (
+                            surface,
+                            lambda surface=surface: self.external_transactions[
+                                surface
+                            ].restore_snapshot_locked(
+                                self.external_snapshots[surface],
+                            ),
+                        )
+                        for surface in _EXTERNAL_COMMIT_SURFACES
+                    ),
+                    *(
+                        (
+                            f"context[{index}]",
+                            lambda binding=binding: setattr(
+                                binding[0], "_registration_binding", binding[1]
+                            ),
+                        )
+                        for index, binding in enumerate(context_bindings_before)
+                    ),
+                    (
+                        "manager",
+                        lambda: self.manager._restore_owned_state_locked(
+                            self.manager_before,
+                        ),
+                    ),
+                ]
+                for surface, restore in rollback_steps:
+                    try:
+                        restore()
+                    except BaseException as rollback_exc:
+                        logger.critical(
+                            "Plugin publication rollback failed for %s after %s",
+                            surface,
+                            type(primary).__name__,
+                            exc_info=True,
+                        )
+                        rollback_errors.append(rollback_exc)
+                if rollback_errors:
+                    primary.__notes__ = getattr(primary, "__notes__", []) + [
+                        "Plugin publication rollback failed; process-local "
+                        "registries may be partially published. Check logs "
+                        "for every rollback failure."
+                    ]
+            raise
+        finally:
+            cleanup_actions: List[tuple[str, Callable[[], None]]] = [
+                (f"commit lock[{index}]", lock.release)
+                for index, lock in enumerate(reversed(acquired_locks))
+            ]
+            if revocation_started:
+                cleanup_actions.append(
+                    (
+                        "live context revocation",
+                        lambda: self.manager._cancel_live_context_revocation(
+                            revoke_generation
+                        ),
+                    )
+                )
+            _run_cleanup_actions(
+                cleanup_actions,
+                primary=sys.exc_info()[1] or active_primary,
+            )
+
+
+class _ForceSweepAbort(RuntimeError):
+    """Internal sentinel: a force candidate failed and must not publish."""
+
+
 # ---------------------------------------------------------------------------
 # PluginContext  – handed to each plugin's ``register()`` function
 # ---------------------------------------------------------------------------
 
+
 class PluginContext:
     """Facade given to plugins so they can register tools and hooks."""
 
-    def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
+    def __init__(
+        self,
+        manifest: PluginManifest,
+        manager: "PluginManager",
+        *,
+        registration_manager: Any = None,
+        registration_registry: Any = None,
+        registration_external_registries: Any = None,
+        registration_lock: Any = None,
+    ):
         self.manifest = manifest
         self._manager = manager
+        # Live contexts share the manager lock; staged transaction contexts use
+        # a transaction-local lock and join the live ordering only at commit.
+        self._registration_lock = registration_lock or manager._context_registration_lock
+        # Managed discovery supplies isolated registry transaction views.
+        # Direct/runtime contexts leave them unset and target live registries.
+        self._registration_binding = _PluginContextBinding(
+            registry=registration_registry,
+            manager=registration_manager or manager,
+            external_registries=registration_external_registries,
+            managed_generation=None,
+        )
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
+
+    def _registration_binding_locked(self) -> _PluginContextBinding:
+        """Read and validate the one authority binding under its owner lock."""
+        binding = self._registration_binding
+        capability = binding.publication_capability
+        if capability is not None and not capability._published:
+            raise RuntimeError(
+                f"Plugin context for {self.manifest.name!r} is not published"
+            )
+        return binding
+
+    def _ensure_live_locked(
+        self,
+        binding: _PluginContextBinding,
+        target: Any,
+    ) -> None:
+        if getattr(target, "_frozen", False):
+            raise RuntimeError("plugin registration view is frozen")
+        generation = binding.managed_generation
+        if generation is None or not isinstance(target, PluginManager):
+            return
+        if target._live_context_generation != generation:
+            raise RuntimeError(
+                f"Plugin context for {self.manifest.name!r} is no longer live"
+            )
+
+    def _acquire_live_lease(
+        self,
+        binding: _PluginContextBinding,
+    ) -> Callable[[], None]:
+        target = binding.manager
+        generation = binding.managed_generation
+        if generation is None or not isinstance(target, PluginManager):
+            return lambda: None
+        return target._acquire_live_context_lease(self.manifest.name, generation)
+
+    def _record_external_registration(
+        self,
+        binding: _PluginContextBinding,
+        surface: str,
+        name: str,
+    ) -> None:
+        target = binding.manager
+        recorder = getattr(target, "_record_external_registration", None)
+        if recorder is not None:
+            with target._lock:
+                self._ensure_live_locked(binding, target)
+                recorder(surface, name)
+
+    def _register_external_value(
+        self,
+        binding: _PluginContextBinding,
+        surface: str,
+        value: Any,
+        live_register: Callable[[Any], Any],
+    ) -> Optional[str]:
+        targets = binding.external_registries
+        if targets is None:
+            release_live = self._acquire_live_lease(binding)
+            try:
+                result = live_register(value)
+                if surface == "secret" and not result:
+                    return None
+                name = value.name
+                if name:
+                    self._record_external_registration(binding, surface, name)
+            finally:
+                release_live()
+        else:
+            transaction, staged = targets[surface]
+            name = transaction.register(staged, value)
+            if name:
+                self._record_external_registration(binding, surface, name)
+        return name
 
     # -- host-owned LLM access ----------------------------------------------
 
@@ -444,21 +1172,39 @@ class PluginContext:
                 f"in config.yaml to allow this plugin to replace built-in tools."
             )
 
-        from tools.registry import registry
+        with self._registration_lock:
+            binding = self._registration_binding_locked()
+            target_registry = binding.registry
+            if target_registry is None:
+                from tools.registry import registry as target_registry
 
-        registry.register(
-            name=name,
-            toolset=toolset,
-            schema=schema,
-            handler=handler,
-            check_fn=check_fn,
-            requires_env=requires_env,
-            is_async=is_async,
-            description=description,
-            emoji=emoji,
-            override=override,
-        )
-        self._manager._plugin_tool_names.add(name)
+            target = binding.manager
+            resolved_description = description or schema.get("description", "")
+            release_live = self._acquire_live_lease(binding)
+            try:
+                target_registry.register(
+                    name=name,
+                    toolset=toolset,
+                    schema=schema,
+                    handler=handler,
+                    check_fn=check_fn,
+                    requires_env=requires_env,
+                    is_async=is_async,
+                    description=resolved_description,
+                    emoji=emoji,
+                    override=override,
+                )
+                with target._lock:
+                    self._ensure_live_locked(binding, target)
+                    target._plugin_tool_names.add(name)
+                    registered = getattr(
+                        target, "_transaction_tools_registered", None
+                    )
+                    if registered is not None and name not in registered:
+                        registered.append(name)
+                    target._generation += 1
+            finally:
+                release_live()
         logger.debug(
             "Plugin %s registered tool: %s%s",
             self.manifest.name, name, " (override)" if override else "",
@@ -489,6 +1235,97 @@ class PluginContext:
         entries = (cfg.get("plugins") or {}).get("entries") or {}
         entry = entries.get(plugin_id) or {}
         return bool(entry.get("allow_tool_override", False))
+
+    # -- governed MCP registration ----------------------------------------
+
+    def _mcp_governance_allowed(self) -> bool:
+        """Require an exact, explicit operator opt-in for this plugin."""
+
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config()
+            if not isinstance(cfg, dict):
+                return False
+            plugins = cfg.get("plugins")
+            if not isinstance(plugins, dict):
+                return False
+            entries = plugins.get("entries")
+            if not isinstance(entries, dict):
+                return False
+            plugin_id = self.manifest.key or self.manifest.name
+            entry = entries.get(plugin_id)
+            return (
+                isinstance(entry, dict)
+                and entry.get("allow_mcp_governance") is True
+            )
+        except Exception:
+            return False
+
+    def register_mcp_governor(self, exact_server_name: str, policy: Any) -> None:
+        """Claim one exact raw MCP server for a neutral two-phase policy.
+
+        The claim is manager-owned and therefore participates in the same
+        staging, conflict check, atomic commit, force-reload rollback, and read
+        locking as the other plugin registration surfaces.
+        """
+
+        if (
+            not isinstance(exact_server_name, str)
+            or not exact_server_name
+            or exact_server_name != exact_server_name.strip()
+            or any(char in exact_server_name for char in "*?[]")
+            or any(ord(char) < 32 or ord(char) == 127 for char in exact_server_name)
+        ):
+            raise MCPGovernanceRegistrationError(
+                "MCP governor requires one exact non-empty raw server name"
+            )
+        if not self._mcp_governance_allowed():
+            plugin_id = self.manifest.key or self.manifest.name
+            raise MCPGovernanceRegistrationError(
+                f"Plugin {plugin_id!r} requires explicit "
+                "allow_mcp_governance: true operator configuration"
+            )
+        if not callable(getattr(policy, "prepare", None)) or not callable(
+            getattr(policy, "finalize", None)
+        ):
+            raise MCPGovernanceRegistrationError(
+                "MCP governor policy must implement prepare and finalize"
+            )
+
+        plugin_id = self.manifest.key or self.manifest.name
+        registration = MCPGovernorRegistration(
+            server_name=exact_server_name,
+            plugin_id=plugin_id,
+            policy=policy,
+            secret_env_names=_manifest_private_secret_names(self.manifest),
+        )
+        with self._registration_lock:
+            binding = self._registration_binding_locked()
+            target = binding.manager
+            release_live = self._acquire_live_lease(binding)
+            try:
+                with target._lock:
+                    self._ensure_live_locked(binding, target)
+                    existing = target._mcp_governors.get(exact_server_name)
+                    if existing is not None:
+                        raise MCPGovernanceRegistrationError(
+                            "MCP server already has a governor"
+                        )
+                    target._mcp_governors[exact_server_name] = registration
+                    registered = getattr(
+                        target, "_transaction_mcp_governors_registered", None
+                    )
+                    if registered is not None:
+                        registered.append(exact_server_name)
+                    target._generation += 1
+            finally:
+                release_live()
+        logger.debug(
+            "Plugin %s registered MCP governor for exact server %s",
+            self.manifest.name,
+            exact_server_name,
+        )
 
     # -- message injection --------------------------------------------------
 
@@ -533,14 +1370,24 @@ class PluginContext:
         The *setup_fn* receives an argparse subparser and should add any
         arguments/sub-subparsers.  If *handler_fn* is provided it is set
         as the default dispatch function via ``set_defaults(func=...)``."""
-        self._manager._cli_commands[name] = {
-            "name": name,
-            "help": help,
-            "description": description,
-            "setup_fn": setup_fn,
-            "handler_fn": handler_fn,
-            "plugin": self.manifest.name,
-        }
+        with self._registration_lock:
+            binding = self._registration_binding_locked()
+            target = binding.manager
+            release_live = self._acquire_live_lease(binding)
+            try:
+                with target._lock:
+                    self._ensure_live_locked(binding, target)
+                    target._cli_commands[name] = {
+                        "name": name,
+                        "help": help,
+                        "description": description,
+                        "setup_fn": setup_fn,
+                        "handler_fn": handler_fn,
+                        "plugin": self.manifest.name,
+                    }
+                    target._generation += 1
+            finally:
+                release_live()
         logger.debug("Plugin %s registered CLI command: %s", self.manifest.name, name)
 
     # -- slash command registration -------------------------------------------
@@ -591,12 +1438,27 @@ class PluginContext:
         except Exception:
             pass  # If commands module isn't available, skip the check
 
-        self._manager._plugin_commands[clean] = {
-            "handler": handler,
-            "description": description or "Plugin command",
-            "plugin": self.manifest.name,
-            "args_hint": (args_hint or "").strip(),
-        }
+        with self._registration_lock:
+            binding = self._registration_binding_locked()
+            target = binding.manager
+            release_live = self._acquire_live_lease(binding)
+            try:
+                with target._lock:
+                    self._ensure_live_locked(binding, target)
+                    target._plugin_commands[clean] = {
+                        "handler": handler,
+                        "description": description or "Plugin command",
+                        "plugin": self.manifest.name,
+                        "args_hint": (args_hint or "").strip(),
+                    }
+                    registered = getattr(
+                        target, "_transaction_commands_registered", None
+                    )
+                    if registered is not None and clean not in registered:
+                        registered.append(clean)
+                    target._generation += 1
+            finally:
+                release_live()
         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
 
     # -- tool dispatch -------------------------------------------------------
@@ -640,13 +1502,6 @@ class PluginContext:
 
         The engine must be an instance of ``agent.context_engine.ContextEngine``.
         """
-        if self._manager._context_engine is not None:
-            logger.warning(
-                "Plugin '%s' tried to register a context engine, but one is "
-                "already registered. Only one context engine plugin is allowed.",
-                self.manifest.name,
-            )
-            return
         # Defer the import to avoid circular deps at module level
         from agent.context_engine import ContextEngine
         if not isinstance(engine, ContextEngine):
@@ -656,7 +1511,24 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        self._manager._context_engine = engine
+        with self._registration_lock:
+            binding = self._registration_binding_locked()
+            target = binding.manager
+            release_live = self._acquire_live_lease(binding)
+            try:
+                with target._lock:
+                    self._ensure_live_locked(binding, target)
+                    if target._context_engine is not None:
+                        logger.warning(
+                            "Plugin '%s' tried to register a context engine, but one is "
+                            "already registered. Only one context engine plugin is allowed.",
+                            self.manifest.name,
+                        )
+                        return
+                    target._context_engine = engine
+                    target._generation += 1
+            finally:
+                release_live()
         logger.info(
             "Plugin '%s' registered context engine: %s",
             self.manifest.name, engine.name,
@@ -683,7 +1555,11 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        register_provider(provider)
+        with self._registration_lock:
+            binding = self._registration_binding_locked()
+            self._register_external_value(
+                binding, "image_gen", provider, register_provider
+            )
         logger.info(
             "Plugin '%s' registered image_gen provider: %s",
             self.manifest.name, provider.name,
@@ -716,13 +1592,22 @@ class PluginContext:
             )
             return
         try:
-            register_provider(provider)
+            with self._registration_lock:
+                binding = self._registration_binding_locked()
+                name = self._register_external_value(
+                    binding,
+                    "dashboard",
+                    provider,
+                    register_provider,
+                )
         except (TypeError, ValueError) as e:
             logger.warning(
                 "Plugin '%s' failed to register dashboard-auth provider "
                 "%r: %s",
                 self.manifest.name, getattr(provider, "name", "?"), e,
             )
+            return
+        if name is None:
             return
         logger.info(
             "Plugin '%s' registered dashboard-auth provider: %s (%s)",
@@ -750,7 +1635,14 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        _register_video_provider(provider)
+        with self._registration_lock:
+            binding = self._registration_binding_locked()
+            self._register_external_value(
+                binding,
+                "video_gen",
+                provider,
+                _register_video_provider,
+            )
         logger.info(
             "Plugin '%s' registered video_gen provider: %s",
             self.manifest.name, provider.name,
@@ -778,7 +1670,11 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        _register_web_provider(provider)
+        with self._registration_lock:
+            binding = self._registration_binding_locked()
+            self._register_external_value(
+                binding, "web", provider, _register_web_provider
+            )
         logger.info(
             "Plugin '%s' registered web provider: %s",
             self.manifest.name, provider.name,
@@ -810,7 +1706,14 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        _register_browser_provider(provider)
+        with self._registration_lock:
+            binding = self._registration_binding_locked()
+            self._register_external_value(
+                binding,
+                "browser",
+                provider,
+                _register_browser_provider,
+            )
         logger.info(
             "Plugin '%s' registered browser provider: %s",
             self.manifest.name, provider.name,
@@ -857,7 +1760,12 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        if register_source(source):
+        with self._registration_lock:
+            binding = self._registration_binding_locked()
+            registered = self._register_external_value(
+                binding, "secret", source, register_source
+            )
+        if registered:
             logger.info(
                 "Plugin '%s' registered secret source: %s",
                 self.manifest.name, source.name,
@@ -895,7 +1803,16 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        _register_tts_provider(provider)
+        with self._registration_lock:
+            binding = self._registration_binding_locked()
+            name = self._register_external_value(
+                binding,
+                "tts",
+                provider,
+                _register_tts_provider,
+            )
+        if name is None:
+            return
         logger.info(
             "Plugin '%s' registered TTS provider: %s",
             self.manifest.name, provider.name,
@@ -939,7 +1856,16 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        _register_stt_provider(provider)
+        with self._registration_lock:
+            binding = self._registration_binding_locked()
+            name = self._register_external_value(
+                binding,
+                "stt",
+                provider,
+                _register_stt_provider,
+            )
+        if name is None:
+            return
         logger.info(
             "Plugin '%s' registered transcription provider: %s",
             self.manifest.name, provider.name,
@@ -993,8 +1919,23 @@ class PluginContext:
             source="plugin",
             **entry_kwargs,
         )
-        platform_registry.register(entry)
-        self._manager._plugin_platform_names.add(name)
+        with self._registration_lock:
+            binding = self._registration_binding_locked()
+            targets = binding.external_registries
+            if targets is None:
+                release_live = self._acquire_live_lease(binding)
+                try:
+                    platform_registry.register(entry)
+                    self._record_external_registration(
+                        binding, "platform", name
+                    )
+                finally:
+                    release_live()
+            else:
+                _transaction, staged = targets["platform"]
+                staged.register(entry)
+                self._record_external_registration(binding, "platform", name)
+
         logger.debug(
             "Plugin %s registered platform: %s",
             self.manifest.name,
@@ -1050,9 +1991,19 @@ class PluginContext:
                 f"Plugin '{self.manifest.name}' tried to register a Slack "
                 f"action handler with an empty action_id."
             )
-        self._manager._slack_action_handlers.append(
-            (action_id, callback, self.manifest.name)
-        )
+        with self._registration_lock:
+            binding = self._registration_binding_locked()
+            target = binding.manager
+            release_live = self._acquire_live_lease(binding)
+            try:
+                with target._lock:
+                    self._ensure_live_locked(binding, target)
+                    target._slack_action_handlers.append(
+                        (action_id, callback, self.manifest.name)
+                    )
+                    target._generation += 1
+            finally:
+                release_live()
         logger.debug(
             "Plugin %s registered Slack action handler: %s",
             self.manifest.name,
@@ -1137,15 +2088,6 @@ class PluginContext:
                 f"Pick a plugin-namespaced key (e.g. '{self.manifest.name}_{key}')."
             )
 
-        # Reject duplicate registrations across plugins
-        existing = self._manager._aux_tasks.get(key)
-        if existing is not None and existing.get("plugin") != self.manifest.name:
-            raise ValueError(
-                f"Plugin '{self.manifest.name}' cannot register auxiliary task "
-                f"{key!r} — already registered by plugin "
-                f"'{existing.get('plugin')}'"
-            )
-
         # Normalize defaults — plugin owns the schema, but we ensure routing
         # fields exist with sensible types so consumers don't crash.
         merged_defaults: Dict[str, Any] = {
@@ -1160,13 +2102,33 @@ class PluginContext:
             for k, v in defaults.items():
                 merged_defaults[k] = v
 
-        self._manager._aux_tasks[key] = {
-            "key": key,
-            "display_name": display_name,
-            "description": description,
-            "defaults": merged_defaults,
-            "plugin": self.manifest.name,
-        }
+        with self._registration_lock:
+            binding = self._registration_binding_locked()
+            target = binding.manager
+            release_live = self._acquire_live_lease(binding)
+            try:
+                with target._lock:
+                    self._ensure_live_locked(binding, target)
+                    existing = target._aux_tasks.get(key)
+                    if (
+                        existing is not None
+                        and existing.get("plugin") != self.manifest.name
+                    ):
+                        raise ValueError(
+                            f"Plugin '{self.manifest.name}' cannot register auxiliary task "
+                            f"{key!r} — already registered by plugin "
+                            f"'{existing.get('plugin')}'"
+                        )
+                    target._aux_tasks[key] = {
+                        "key": key,
+                        "display_name": display_name,
+                        "description": description,
+                        "defaults": merged_defaults,
+                        "plugin": self.manifest.name,
+                    }
+                    target._generation += 1
+            finally:
+                release_live()
         logger.debug(
             "Plugin %s registered auxiliary task: %s (%s)",
             self.manifest.name,
@@ -1188,7 +2150,17 @@ class PluginContext:
                 hook_name,
                 ", ".join(sorted(VALID_HOOKS)),
             )
-        self._manager._hooks.setdefault(hook_name, []).append(callback)
+        with self._registration_lock:
+            binding = self._registration_binding_locked()
+            target = binding.manager
+            release_live = self._acquire_live_lease(binding)
+            try:
+                with target._lock:
+                    self._ensure_live_locked(binding, target)
+                    target._hooks.setdefault(hook_name, []).append(callback)
+                    target._generation += 1
+            finally:
+                release_live()
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
 
     # -- middleware registration -------------------------------------------
@@ -1209,7 +2181,17 @@ class PluginContext:
                 kind,
                 ", ".join(sorted(VALID_MIDDLEWARE)),
             )
-        self._manager._middleware.setdefault(kind, []).append(callback)
+        with self._registration_lock:
+            binding = self._registration_binding_locked()
+            target = binding.manager
+            release_live = self._acquire_live_lease(binding)
+            try:
+                with target._lock:
+                    self._ensure_live_locked(binding, target)
+                    target._middleware.setdefault(kind, []).append(callback)
+                    target._generation += 1
+            finally:
+                release_live()
         logger.debug("Plugin %s registered middleware: %s", self.manifest.name, kind)
 
     # -- skill registration -------------------------------------------------
@@ -1248,12 +2230,22 @@ class PluginContext:
             raise FileNotFoundError(f"SKILL.md not found at {path}")
 
         qualified = f"{self.manifest.name}:{name}"
-        self._manager._plugin_skills[qualified] = {
-            "path": path,
-            "plugin": self.manifest.name,
-            "bare_name": name,
-            "description": description,
-        }
+        with self._registration_lock:
+            binding = self._registration_binding_locked()
+            target = binding.manager
+            release_live = self._acquire_live_lease(binding)
+            try:
+                with target._lock:
+                    self._ensure_live_locked(binding, target)
+                    target._plugin_skills[qualified] = {
+                        "path": path,
+                        "plugin": self.manifest.name,
+                        "bare_name": name,
+                        "description": description,
+                    }
+                    target._generation += 1
+            finally:
+                release_live()
         logger.debug(
             "Plugin %s registered skill: %s",
             self.manifest.name, qualified,
@@ -1268,11 +2260,20 @@ class PluginManager:
     """Central manager that discovers, loads, and invokes plugins."""
 
     def __init__(self) -> None:
+        # Discovery writers serialize here while readers keep using the live
+        # generation. Plugin callbacks are never invoked under registry locks.
+        self._discovery_lock = threading.RLock()
+        self._context_registration_lock = threading.RLock()
+        self._lock = threading.RLock()
+        self._generation = 0
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
+        self._plugin_external_names: Dict[str, Set[str]] = {
+            surface: set() for surface in _EXTERNAL_COMMIT_SURFACES
+        }
         self._cli_commands: Dict[str, dict] = {}
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
@@ -1290,52 +2291,212 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        self._live_context_generation = 0
+        self._live_context_condition = threading.Condition(threading.RLock())
+        self._live_context_active: Dict[int, int] = {}
+        self._live_context_active_by_thread: Dict[tuple[int, int], int] = {}
+        self._live_context_revoking: set[int] = set()
+        # Exact raw MCP server name -> immutable policy attribution. Governors
+        # are absent from the model schema and are read only at invocation.
+        self._mcp_governors: Dict[str, MCPGovernorRegistration] = {}
 
-    # -----------------------------------------------------------------------
-    # Public
-    # -----------------------------------------------------------------------
+    def _record_external_registration(self, surface: str, name: str) -> None:
+        self._plugin_external_names.setdefault(surface, set()).add(name)
+        if surface == "platform":
+            self._plugin_platform_names.add(name)
+        self._generation += 1
+
+    def _acquire_live_context_lease(
+        self,
+        plugin_name: str,
+        generation: int,
+    ) -> Callable[[], None]:
+        owner_thread_id = threading.get_ident()
+        owner_key = (generation, owner_thread_id)
+        with self._live_context_condition:
+            if (
+                self._live_context_generation != generation
+                or generation in self._live_context_revoking
+            ):
+                raise RuntimeError(
+                    f"Plugin context for {plugin_name!r} is no longer live"
+                )
+            self._live_context_active[generation] = (
+                self._live_context_active.get(generation, 0) + 1
+            )
+            self._live_context_active_by_thread[owner_key] = (
+                self._live_context_active_by_thread.get(owner_key, 0) + 1
+            )
+
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if released:
+                return
+            released = True
+            with self._live_context_condition:
+                active = self._live_context_active.get(generation, 0)
+                if active <= 1:
+                    self._live_context_active.pop(generation, None)
+                    self._live_context_condition.notify_all()
+                else:
+                    self._live_context_active[generation] = active - 1
+                thread_active = self._live_context_active_by_thread.get(owner_key, 0)
+                if thread_active <= 1:
+                    self._live_context_active_by_thread.pop(owner_key, None)
+                else:
+                    self._live_context_active_by_thread[owner_key] = thread_active - 1
+
+        return release
+
+    def _reject_reentrant_force_reload(self, generation: int) -> None:
+        with self._live_context_condition:
+            if self._live_context_active_by_thread.get(
+                (generation, threading.get_ident()),
+                0,
+            ):
+                raise RuntimeError(
+                    "force reload cannot run from a live plugin registration"
+                )
+
+    def _begin_live_context_revocation(self, generation: int) -> None:
+        with self._live_context_condition:
+            self._reject_reentrant_force_reload(generation)
+            if self._live_context_active.get(generation, 0):
+                raise _ForceSweepAbort(
+                    "plugin force reload conflicted with an active live registration"
+                )
+            self._live_context_revoking.add(generation)
+
+    def _cancel_live_context_revocation(self, generation: int) -> None:
+        with self._live_context_condition:
+            self._live_context_revoking.discard(generation)
+            self._live_context_condition.notify_all()
+
+    def _snapshot_owned_state(self) -> _PluginManagerState:
+        """Take a non-aliasing checkpoint under the manager state lock."""
+        with self._lock:
+            return _PluginManagerState(self)
+
+    def _install_owned_state_locked(self, state: Any) -> None:
+        """Install already-independent manager state while ``_lock`` is held."""
+        self._plugins = state._plugins
+        self._hooks = state._hooks
+        self._middleware = state._middleware
+        self._plugin_tool_names = state._plugin_tool_names
+        self._plugin_platform_names = state._plugin_platform_names
+        self._plugin_external_names = state._plugin_external_names
+        self._cli_commands = state._cli_commands
+        self._context_engine = state._context_engine
+        self._plugin_commands = state._plugin_commands
+        self._plugin_skills = state._plugin_skills
+        self._aux_tasks = state._aux_tasks
+        self._slack_action_handlers = state._slack_action_handlers
+        self._mcp_governors = state._mcp_governors
+        self._discovered = state._discovered
+        self._live_context_generation = state._live_context_generation
+        self._generation = max(self._generation, state._generation) + 1
+
+    def _restore_owned_state_locked(self, state: Any) -> None:
+        """Restore a transaction checkpoint exactly while ``_lock`` is held."""
+        self._plugins = state._plugins
+        self._hooks = state._hooks
+        self._middleware = state._middleware
+        self._plugin_tool_names = state._plugin_tool_names
+        self._plugin_platform_names = state._plugin_platform_names
+        self._plugin_external_names = state._plugin_external_names
+        self._cli_commands = state._cli_commands
+        self._context_engine = state._context_engine
+        self._plugin_commands = state._plugin_commands
+        self._plugin_skills = state._plugin_skills
+        self._aux_tasks = state._aux_tasks
+        self._slack_action_handlers = state._slack_action_handlers
+        self._mcp_governors = state._mcp_governors
+        self._discovered = state._discovered
+        self._live_context_generation = state._live_context_generation
+        self._generation = state._generation
 
     def discover_and_load(self, force: bool = False) -> None:
-        """Scan all plugin sources and load each plugin found.
-
-        When ``force`` is true, clear cached discovery state first so config
-        changes or newly-added bundled backends become visible in long-lived
-        sessions without requiring a full agent restart.
-        """
-        if self._discovered and not force:
-            return
-        if env_var_enabled("HERMES_SAFE_MODE"):
-            logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
-            self._discovered = True
-            return
+        """Load plugins, publishing a force reload as one complete generation."""
         if force:
-            self._plugins.clear()
-            self._hooks.clear()
-            self._middleware.clear()
-            self._plugin_tool_names.clear()
-            self._plugin_platform_names.clear()
-            self._cli_commands.clear()
-            self._plugin_commands.clear()
-            self._plugin_skills.clear()
-            self._aux_tasks.clear()
-            self._slack_action_handlers.clear()
-            self._context_engine = None
-        # Set the flag up front as a re-entrancy guard (a plugin's register()
-        # can transitively trigger discovery again), but reset it if the sweep
-        # raises so a failed scan is NOT cached as "discovered with an empty
-        # registry" — callers swallow the exception and would otherwise be
-        # permanently stranded on the early-return above (the "No web provider
-        # configured" class of failures).
-        self._discovered = True
-        try:
-            self._discover_and_load_inner()
-        except BaseException:
-            self._discovered = False
-            raise
+            self._reject_reentrant_force_reload(self._live_context_generation)
+            self._force_discover_and_load()
+            return
+        with self._discovery_lock:
+            with self._lock:
+                if self._discovered:
+                    return
+            if env_var_enabled("HERMES_SAFE_MODE"):
+                logger.info("HERMES_SAFE_MODE=1 - plugin discovery skipped")
+                with self._lock:
+                    self._discovered = True
+                    self._generation += 1
+                return
 
-    def _discover_and_load_inner(self) -> None:
+            with self._lock:
+                self._discovered = True
+                self._generation += 1
+            try:
+                self._discover_and_load_inner()
+            except BaseException:
+                # Initial discovery publishes the complete active-winner deny
+                # set before importing any plugin. Keep that safe overblock if
+                # a later plugin raises BaseException; partial registrations
+                # remain committed and the next call retries the sweep.
+                with self._lock:
+                    self._discovered = False
+                    self._generation += 1
+                raise
+
+    def _force_discover_and_load(self) -> None:
+        """Stage and publish a force generation under discovery serialization."""
+        with self._discovery_lock:
+            if env_var_enabled("HERMES_SAFE_MODE"):
+                logger.info("HERMES_SAFE_MODE=1 - plugin discovery skipped")
+                with self._lock:
+                    self._discovered = True
+                    self._generation += 1
+                return
+
+            # Private names are a deny-only security policy. Publish the
+            # complete candidate set inside _discover_and_load_inner() before
+            # arbitrary plugin code runs, then restore this exact checkpoint
+            # if the candidate generation cannot commit.
+            private_policy_snapshot = snapshot_private_secret_policy()
+            transaction = _RegistrationTransaction(
+                self,
+                replace_owned=True,
+            )
+            module_snapshot = _snapshot_module_namespace(_NS_PARENT)
+            try:
+                self._discover_and_load_inner(transaction)
+                transaction.commit()
+            except (_ForceSweepAbort, RegistryTransactionConflict) as exc:
+                restore_private_secret_policy(private_policy_snapshot)
+                _restore_module_namespace(_NS_PARENT, module_snapshot)
+                if isinstance(exc, RegistryTransactionConflict):
+                    logger.warning(
+                        "Plugin force-reload commit conflict: "
+                        "surface=%s expected_generation=%d "
+                        "actual_generation=%d; retaining prior generation",
+                        exc.surface,
+                        exc.expected_generation,
+                        exc.actual_generation,
+                    )
+                return
+            except BaseException:
+                restore_private_secret_policy(private_policy_snapshot)
+                _restore_module_namespace(_NS_PARENT, module_snapshot)
+                raise
+
+    def _discover_and_load_inner(
+        self,
+        transaction: Optional[_RegistrationTransaction] = None,
+    ) -> None:
         """The actual discovery sweep — see :meth:`discover_and_load`."""
         manifests: List[PluginManifest] = []
+        target = transaction.manager_view if transaction is not None else self
 
         # 1. Bundled plugins (<repo>/plugins/<name>/)
         #
@@ -1401,6 +2562,23 @@ class PluginManager:
         winners: Dict[str, PluginManifest] = {}
         for manifest in manifests:
             winners[manifest.key or manifest.name] = manifest
+
+        # Build the complete replacement while the old immutable deny set
+        # remains live. Publish once, before any winning plugin module is
+        # imported or any deferred arbitrary-code loader is registered.
+        private_names: set[str] = set()
+        invalid_private_declarations: set[str] = set()
+        for lookup_key, manifest in winners.items():
+            if not _manifest_is_active_for_general_discovery(
+                manifest, disabled, enabled
+            ):
+                continue
+            try:
+                private_names.update(_manifest_private_secret_names(manifest))
+            except PrivateSecretPolicyError:
+                invalid_private_declarations.add(lookup_key)
+        replace_private_secret_names(private_names)
+
         for manifest in winners.values():
             lookup_key = manifest.key or manifest.name
 
@@ -1409,8 +2587,30 @@ class PluginManager:
             if lookup_key in disabled or manifest.name in disabled:
                 loaded = LoadedPlugin(manifest=manifest, enabled=False)
                 loaded.error = "disabled via config"
-                self._plugins[lookup_key] = loaded
+                with target._lock:
+                    target._plugins[lookup_key] = loaded
+                    target._generation += 1
                 logger.debug("Skipping disabled plugin '%s'", lookup_key)
+                continue
+
+            # A malformed private declaration disables an otherwise active
+            # plugin before import. Manifest metadata is attacker-controlled,
+            # so neither the declaration nor the underlying exception is
+            # reflected into logs.
+            if lookup_key in invalid_private_declarations:
+                loaded = LoadedPlugin(manifest=manifest, enabled=False)
+                loaded.error = (
+                    "PrivateSecretPolicyError: plugin private-secret "
+                    "declaration invalid"
+                )
+                with target._lock:
+                    target._plugins[lookup_key] = loaded
+                    target._generation += 1
+                logger.warning(
+                    "Failed to load plugin '%s': invalid private-secret "
+                    "environment declaration",
+                    manifest.name,
+                )
                 continue
 
             # Exclusive plugins (memory providers) have their own
@@ -1421,7 +2621,9 @@ class PluginManager:
                 loaded.error = (
                     "exclusive plugin — activate via <category>.provider config"
                 )
-                self._plugins[lookup_key] = loaded
+                with target._lock:
+                    target._plugins[lookup_key] = loaded
+                    target._generation += 1
                 logger.debug(
                     "Skipping '%s' (exclusive, handled by category discovery)",
                     lookup_key,
@@ -1436,7 +2638,9 @@ class PluginManager:
             # override semantics between bundled and user plugins.
             if manifest.kind == "model-provider":
                 loaded = LoadedPlugin(manifest=manifest, enabled=True)
-                self._plugins[lookup_key] = loaded
+                with target._lock:
+                    target._plugins[lookup_key] = loaded
+                    target._generation += 1
                 logger.debug(
                     "Skipping '%s' (model-provider, handled by providers/ discovery)",
                     lookup_key,
@@ -1448,7 +2652,7 @@ class PluginManager:
             # services calls) is driven by ``<category>.provider`` config,
             # enforced by the tool wrapper.
             if manifest.source == "bundled" and manifest.kind == "backend":
-                self._load_plugin(manifest)
+                self._load_plugin(manifest, transaction=transaction)
                 continue
 
             # Bundled platform plugins (gateway adapters: telegram, discord,
@@ -1463,7 +2667,10 @@ class PluginManager:
             # path actually asks for that platform. Every platform Hermes ships
             # remains available out of the box — it just loads on first use.
             if manifest.source == "bundled" and manifest.kind == "platform":
-                self._register_deferred_platform(manifest)
+                self._register_deferred_platform(
+                    manifest,
+                    transaction=transaction,
+                )
                 continue
 
             # Everything else (standalone, user-installed backends,
@@ -1480,18 +2687,25 @@ class PluginManager:
                     "not enabled in config (run `hermes plugins enable {}` to activate)"
                     .format(lookup_key)
                 )
-                self._plugins[lookup_key] = loaded
+                with target._lock:
+                    target._plugins[lookup_key] = loaded
+                    target._generation += 1
                 logger.debug(
                     "Skipping '%s' (not in plugins.enabled)", lookup_key
                 )
                 continue
-            self._load_plugin(manifest)
+            self._load_plugin(manifest, transaction=transaction)
 
         if manifests:
+            with target._lock:
+                found_count = len(target._plugins)
+                enabled_count = sum(
+                    1 for plugin in target._plugins.values() if plugin.enabled
+                )
             logger.info(
                 "Plugin discovery complete: %d found, %d enabled",
-                len(self._plugins),
-                sum(1 for p in self._plugins.values() if p.enabled),
+                found_count,
+                enabled_count,
             )
 
     # -----------------------------------------------------------------------
@@ -1723,130 +2937,169 @@ class PluginManager:
             return Path(manifest.path).name
         return name
 
-    def _register_deferred_platform(self, manifest: PluginManifest) -> None:
-        """Register a lazy loader for a bundled platform plugin.
-
-        The platform adapter module is imported only when the gateway / cron /
-        setup / send_message path first asks the ``platform_registry`` for this
-        platform. Until then we record a lightweight ``LoadedPlugin`` so
-        ``hermes plugins list`` still shows the platform as available, and we
-        hand the registry a loader that runs the normal eager-load path.
-        """
+    def _register_deferred_platform(
+        self,
+        manifest: PluginManifest,
+        transaction: Optional[_RegistrationTransaction] = None,
+    ) -> None:
+        """Stage a bundled platform loader with its manager attribution."""
+        own_transaction = transaction is None
+        transaction = transaction or _RegistrationTransaction(self)
+        target = transaction.manager_view
         lookup_key = manifest.key or manifest.name
         platform_name = self._platform_name_from_manifest(manifest)
 
-        # Record an enabled placeholder for introspection (`hermes plugins
-        # list`). The real module load swaps in a fully-populated LoadedPlugin
-        # (tools/hooks/commands attribution) when the loader fires.
         loaded = LoadedPlugin(manifest=manifest, enabled=True)
         loaded.deferred = True
-        self._plugins[lookup_key] = loaded
+        with target._lock:
+            target._plugins[lookup_key] = loaded
+            target._record_external_registration("platform", platform_name)
 
         def _loader(_manifest: PluginManifest = manifest) -> None:
             self._load_plugin(_manifest)
 
-        try:
-            from gateway.platform_registry import platform_registry
-
-            platform_registry.register_deferred(platform_name, _loader)
-            logger.debug(
-                "Registered deferred platform loader: %s (plugin=%s)",
-                platform_name,
-                lookup_key,
-            )
-        except Exception:
-            # If the registry import fails for any reason, fall back to eager
-            # loading so the platform is never silently lost.
-            logger.debug(
-                "Deferred platform registration failed for '%s'; eager-loading",
-                lookup_key,
-                exc_info=True,
-            )
-            self._load_plugin(manifest)
-
-    def _load_plugin(self, manifest: PluginManifest) -> None:
-        """Import a plugin module and call its ``register(ctx)`` function."""
-        loaded = LoadedPlugin(manifest=manifest)
+        transaction.external_views["platform"].register_deferred(
+            platform_name,
+            _loader,
+        )
+        if own_transaction:
+            transaction.commit()
         logger.debug(
-            "Loading plugin '%s' (source=%s, kind=%s, path=%s)",
-            manifest.key or manifest.name, manifest.source, manifest.kind, manifest.path,
+            "Registered deferred platform loader: %s (plugin=%s)",
+            platform_name,
+            lookup_key,
         )
 
-        from tools.registry import registry as _registry
-        _plugin_id = manifest.key or manifest.name
-        _slug = _plugin_id.replace("/", "__").replace("-", "_")
-        _registry.register_plugin_override_policy(
-            f"{_NS_PARENT}.{_slug}",
-            PluginContext(manifest, self)._tool_override_allowed(""),
+    def _load_plugin(
+        self,
+        manifest: PluginManifest,
+        transaction: Optional[_RegistrationTransaction] = None,
+    ) -> None:
+        """Stage one plugin and publish only through the ordered transaction."""
+        with self._discovery_lock:
+            self._load_plugin_serialized(manifest, transaction)
+
+    def _load_plugin_serialized(
+        self,
+        manifest: PluginManifest,
+        transaction: Optional[_RegistrationTransaction],
+    ) -> None:
+        own_transaction = transaction is None
+        transaction = transaction or _RegistrationTransaction(self)
+        loaded = LoadedPlugin(manifest=manifest)
+        plugin_id = manifest.key or manifest.name
+        module_root = (
+            _directory_module_name(manifest)
+            if manifest.source in {"user", "project", "bundled"}
+            else None
+        )
+        manager_before = _PluginManagerState(transaction.manager_view)
+        tools_start = len(transaction.manager_view._transaction_tools_registered)
+        commands_start = len(
+            transaction.manager_view._transaction_commands_registered
+        )
+        governors_start = len(
+            transaction.manager_view._transaction_mcp_governors_registered
+        )
+        modules_before = (
+            _snapshot_module_namespace(module_root) if module_root else {}
+        )
+        phase = "import"
+        context = PluginContext(
+            manifest,
+            self,
+            registration_manager=transaction.manager_view,
+            registration_registry=transaction.tool_view,
+            registration_external_registries=transaction.context_targets(),
+            registration_lock=transaction.registration_lock,
         )
         try:
+            transaction.tool_view.register_plugin_override_policy(
+                module_root or plugin_id,
+                context._tool_override_allowed(""),
+            )
             if manifest.source in {"user", "project", "bundled"}:
                 module = self._load_directory_module(manifest)
             else:
                 module = self._load_entrypoint_module(manifest)
 
             loaded.module = module
-
-            # Call register()
             register_fn = getattr(module, "register", None)
             if register_fn is None:
-                loaded.error = "no register() function"
-                logger.warning("Plugin '%s' has no register() function", manifest.name)
-            else:
-                ctx = PluginContext(manifest, self)
-                # Snapshot registry state BEFORE register() so each registry's
-                # attribution counts only what THIS plugin actually added.
-                # The previous approach diffed names against all already-loaded
-                # plugins, which mis-credited a plugin that registered a hook /
-                # middleware / tool name an earlier plugin had already used:
-                # the shared name was attributed to the first plugin only, so
-                # later plugins under-reported in `hermes plugins list`.
-                _tools_before = set(self._plugin_tool_names)
-                _hook_counts_before = {
-                    h: len(cbs) for h, cbs in self._hooks.items()
-                }
-                _mw_counts_before = {
-                    kind: len(cbs) for kind, cbs in self._middleware.items()
-                }
-                register_fn(ctx)
-                loaded.tools_registered = [
-                    t for t in self._plugin_tool_names
-                    if t not in _tools_before
-                ]
-                loaded.hooks_registered = [
-                    h
-                    for h, cbs in self._hooks.items()
-                    if len(cbs) > _hook_counts_before.get(h, 0)
-                ]
-                loaded.middleware_registered = [
-                    kind
-                    for kind, cbs in self._middleware.items()
-                    if len(cbs) > _mw_counts_before.get(kind, 0)
-                ]
-                loaded.commands_registered = [
-                    c for c in self._plugin_commands
-                    if self._plugin_commands[c].get("plugin") == manifest.name
-                ]
-                loaded.enabled = True
-                logger.debug(
-                    "  registered: %d tool(s), %d hook(s), %d middleware, %d slash command(s), %d CLI command(s)",
-                    len(loaded.tools_registered),
-                    len(loaded.hooks_registered),
-                    len(loaded.middleware_registered),
-                    len(loaded.commands_registered),
-                    sum(
-                        1 for c in self._cli_commands
-                        if self._cli_commands[c].get("plugin") == manifest.name
-                    ),
-                )
+                raise RuntimeError("plugin has no register function")
 
-        except Exception as exc:
-            loaded.error = str(exc)
-            logger.warning(
-                "Failed to load plugin '%s': %s",
-                manifest.name, exc, exc_info=_PLUGINS_DEBUG,
+            phase = "registration"
+            register_fn(context)
+            staged = transaction.manager_view
+            loaded.tools_registered = list(
+                staged._transaction_tools_registered[tools_start:]
             )
-        self._plugins[manifest.key or manifest.name] = loaded
+            loaded.hooks_registered = [
+                name
+                for name, callbacks in staged._hooks.items()
+                if len(callbacks) > len(manager_before._hooks.get(name, []))
+            ]
+            loaded.middleware_registered = [
+                name
+                for name, callbacks in staged._middleware.items()
+                if len(callbacks) > len(manager_before._middleware.get(name, []))
+            ]
+            loaded.commands_registered = list(
+                staged._transaction_commands_registered[commands_start:]
+            )
+            loaded.mcp_governors_registered = list(
+                staged._transaction_mcp_governors_registered[governors_start:]
+            )
+            loaded.enabled = True
+            with staged._lock:
+                staged._plugins[plugin_id] = loaded
+                staged._generation += 1
+            transaction.contexts.append(context)
+            phase = "commit"
+            if own_transaction:
+                transaction.commit()
+            logger.debug(
+                "Plugin '%s' staged %d tool(s), %d hook(s), %d middleware, "
+                "%d slash command(s)",
+                plugin_id,
+                len(loaded.tools_registered),
+                len(loaded.hooks_registered),
+                len(loaded.middleware_registered),
+                len(loaded.commands_registered),
+            )
+            return
+        except BaseException as exc:
+            if module_root:
+                _restore_module_namespace(module_root, modules_before)
+            loaded.enabled = False
+            loaded.module = None
+            if not isinstance(exc, Exception):
+                raise
+            loaded.error = (
+                "RuntimeError: plugin commit failed"
+                if phase == "commit"
+                else f"{type(exc).__name__}: plugin {phase} failed"
+            )
+            if isinstance(exc, RegistryTransactionConflict):
+                logger.warning(
+                    "Plugin commit conflict: plugin=%s surface=%s "
+                    "expected_generation=%d actual_generation=%d",
+                    plugin_id,
+                    exc.surface,
+                    exc.expected_generation,
+                    exc.actual_generation,
+                )
+            else:
+                logger.warning(
+                    "Failed to load plugin '%s': %s",
+                    manifest.name,
+                    loaded.error,
+                )
+            if not own_transaction:
+                raise _ForceSweepAbort() from None
+            with self._lock:
+                self._plugins[plugin_id] = loaded
+                self._generation += 1
 
     def _load_directory_module(self, manifest: PluginManifest) -> types.ModuleType:
         """Import a directory-based plugin as ``hermes_plugins.<slug>``.
@@ -1868,9 +3121,10 @@ class PluginManager:
             ns_pkg.__package__ = _NS_PARENT
             sys.modules[_NS_PARENT] = ns_pkg
 
-        key = manifest.key or manifest.name
-        slug = key.replace("/", "__").replace("-", "_")
-        module_name = f"{_NS_PARENT}.{slug}"
+        module_name = _directory_module_name(manifest)
+        # A force reload must execute against a clean package tree. The caller
+        # already captured prior identities and will restore them on failure.
+        _restore_module_namespace(module_name, {})
         spec = importlib.util.spec_from_file_location(
             module_name,
             init_file,
@@ -1929,7 +3183,8 @@ class PluginManager:
         persisted to session DB.
         """
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
-        callbacks = self._hooks.get(hook_name, [])
+        with self._lock:
+            callbacks = list(self._hooks.get(hook_name, []))
         results: List[Any] = []
         for cb in callbacks:
             try:
@@ -1947,11 +3202,13 @@ class PluginManager:
 
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
-        return bool(self._hooks.get(hook_name))
+        with self._lock:
+            return bool(self._hooks.get(hook_name))
 
     def has_middleware(self, kind: str) -> bool:
         """Return True when at least one callback is registered for middleware."""
-        return bool(self._middleware.get(kind))
+        with self._lock:
+            return bool(self._middleware.get(kind))
 
     def invoke_middleware(self, kind: str, **kwargs: Any) -> List[Any]:
         """Call registered middleware callbacks for *kind*.
@@ -1960,7 +3217,8 @@ class PluginManager:
         path. Middleware that wants to change behavior must return the shape
         documented by the caller-specific contract.
         """
-        callbacks = self._middleware.get(kind, [])
+        with self._lock:
+            callbacks = list(self._middleware.get(kind, []))
         results: List[Any] = []
         for cb in callbacks:
             try:
@@ -1990,7 +3248,8 @@ class PluginManager:
         Plugins register handlers via
         :meth:`PluginContext.register_slack_action_handler`.
         """
-        return list(self._slack_action_handlers)
+        with self._lock:
+            return list(self._slack_action_handlers)
 
     # -----------------------------------------------------------------------
     # Introspection
@@ -1998,8 +3257,10 @@ class PluginManager:
 
     def list_plugins(self) -> List[Dict[str, Any]]:
         """Return a list of info dicts for all discovered plugins."""
+        with self._lock:
+            plugins = sorted(self._plugins.items())
         result: List[Dict[str, Any]] = []
-        for key, loaded in sorted(self._plugins.items()):
+        for key, loaded in plugins:
             result.append(
                 {
                     "name": loaded.manifest.name,
@@ -2024,21 +3285,83 @@ class PluginManager:
 
     def find_plugin_skill(self, qualified_name: str) -> Optional[Path]:
         """Return the ``Path`` to a plugin skill's SKILL.md, or ``None``."""
-        entry = self._plugin_skills.get(qualified_name)
+        with self._lock:
+            entry = self._plugin_skills.get(qualified_name)
         return entry["path"] if entry else None
 
     def list_plugin_skills(self, plugin_name: str) -> List[str]:
         """Return sorted bare names of all skills registered by *plugin_name*."""
         prefix = f"{plugin_name}:"
-        return sorted(
-            e["bare_name"]
-            for qn, e in self._plugin_skills.items()
-            if qn.startswith(prefix)
-        )
+        with self._lock:
+            return sorted(
+                e["bare_name"]
+                for qn, e in self._plugin_skills.items()
+                if qn.startswith(prefix)
+            )
 
     def remove_plugin_skill(self, qualified_name: str) -> None:
         """Remove a stale registry entry (silently ignores missing keys)."""
-        self._plugin_skills.pop(qualified_name, None)
+        with self._lock:
+            self._plugin_skills.pop(qualified_name, None)
+
+    def get_context_engine(self) -> Any:
+        with self._lock:
+            return self._context_engine
+
+    def get_plugin_command(self, name: str) -> Optional[dict]:
+        with self._lock:
+            entry = self._plugin_commands.get(name)
+            return dict(entry) if entry else None
+
+    def get_plugin_commands(self) -> Dict[str, dict]:
+        with self._lock:
+            return {
+                name: dict(entry)
+                for name, entry in self._plugin_commands.items()
+            }
+
+    def get_cli_commands(self) -> Dict[str, dict]:
+        with self._lock:
+            return {
+                name: dict(entry) for name, entry in self._cli_commands.items()
+            }
+
+    def get_auxiliary_tasks(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [
+                {
+                    **self._aux_tasks[key],
+                    "defaults": dict(
+                        self._aux_tasks[key].get("defaults", {})
+                    ),
+                }
+                for key in sorted(self._aux_tasks)
+            ]
+
+    def get_middleware_callbacks(self, kind: str) -> List[Callable]:
+        with self._lock:
+            return list(self._middleware.get(kind, []))
+
+    def get_tool_state_snapshot(
+        self,
+    ) -> tuple[Set[str], Dict[str, LoadedPlugin]]:
+        with self._lock:
+            return set(self._plugin_tool_names), dict(self._plugins)
+
+    def get_mcp_governor(self, exact_server_name: str) -> MCPGovernorRegistration | None:
+        """Return one immutable exact-server registration under the state lock."""
+
+        with self._lock:
+            return self._mcp_governors.get(exact_server_name)
+
+    def get_mcp_governor_attribution(
+        self, exact_server_name: str
+    ) -> str | None:
+        """Return the owning plugin id without exposing mutable manager state."""
+
+        with self._lock:
+            registration = self._mcp_governors.get(exact_server_name)
+            return registration.plugin_id if registration is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -2063,6 +3386,17 @@ def discover_plugins(force: bool = False) -> None:
     manifests and reload state in the current process.
     """
     get_plugin_manager().discover_and_load(force=force)
+
+
+def get_mcp_governor(
+    exact_server_name: str,
+) -> MCPGovernorRegistration | None:
+    """Read the active exact-server governor from the process manager."""
+
+    manager = _plugin_manager
+    if manager is None:
+        return None
+    return manager.get_mcp_governor(exact_server_name)
 
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
@@ -2358,12 +3692,12 @@ def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
 
 def get_plugin_context_engine():
     """Return the plugin-registered context engine, or None."""
-    return _ensure_plugins_discovered()._context_engine
+    return _ensure_plugins_discovered().get_context_engine()
 
 
 def get_plugin_command_handler(name: str) -> Optional[Callable]:
     """Return the handler for a plugin-registered slash command, or ``None``."""
-    entry = _ensure_plugins_discovered()._plugin_commands.get(name)
+    entry = _ensure_plugins_discovered().get_plugin_command(name)
     return entry["handler"] if entry else None
 
 
@@ -2422,7 +3756,7 @@ def get_plugin_commands() -> Dict[str, dict]:
     Triggers idempotent plugin discovery so callers can use plugin commands
     before any explicit discover_plugins() call.
     """
-    return _ensure_plugins_discovered()._plugin_commands
+    return _ensure_plugins_discovered().get_plugin_commands()
 
 
 def get_plugin_auxiliary_tasks() -> List[Dict[str, Any]]:
@@ -2436,8 +3770,7 @@ def get_plugin_auxiliary_tasks() -> List[Dict[str, Any]]:
     before any explicit ``discover_plugins()`` call. Sorted by ``key`` for
     deterministic ordering in pickers and tests.
     """
-    manager = _ensure_plugins_discovered()
-    return [manager._aux_tasks[k] for k in sorted(manager._aux_tasks)]
+    return _ensure_plugins_discovered().get_auxiliary_tasks()
 
 
 def get_plugin_toolsets() -> List[tuple]:
@@ -2447,7 +3780,8 @@ def get_plugin_toolsets() -> List[tuple]:
     alongside the built-in ones and can be toggled on/off per platform.
     """
     manager = get_plugin_manager()
-    if not manager._plugin_tool_names:
+    plugin_tool_names, loaded_plugins = manager.get_tool_state_snapshot()
+    if not plugin_tool_names:
         return []
 
     try:
@@ -2458,7 +3792,7 @@ def get_plugin_toolsets() -> List[tuple]:
     # Group plugin tool names by their toolset
     toolset_tools: Dict[str, List[str]] = {}
     toolset_plugin: Dict[str, LoadedPlugin] = {}
-    for tool_name in manager._plugin_tool_names:
+    for tool_name in plugin_tool_names:
         entry = registry.get_entry(tool_name)
         if not entry:
             continue
@@ -2466,7 +3800,7 @@ def get_plugin_toolsets() -> List[tuple]:
         toolset_tools.setdefault(ts, []).append(entry.name)
 
     # Map toolsets back to the plugin that registered them
-    for _name, loaded in manager._plugins.items():
+    for _name, loaded in loaded_plugins.items():
         for tool_name in loaded.tools_registered:
             entry = registry.get_entry(tool_name)
             if entry and entry.toolset in toolset_tools:

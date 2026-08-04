@@ -5,6 +5,8 @@ art).
 """
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from hermes_cli.dashboard_auth import clear_providers, get_provider
@@ -46,6 +48,11 @@ class _MinimalManager:
     _cli_ref = None
     _context_engine = None
     _tools: dict = {}
+
+    def __init__(self) -> None:
+        # PluginContext's authority lock is manager-owned so every context for
+        # one manager participates in the same registration lock order.
+        self._context_registration_lock = threading.RLock()
 
 
 @pytest.fixture(autouse=True)

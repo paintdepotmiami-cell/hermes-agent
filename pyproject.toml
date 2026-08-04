@@ -2,7 +2,7 @@
 
 [project]
 name = "hermes-agent"
-version = "0.19.1"
+version = "0.20.0"
 description = "The self-improving AI agent — creates skills from experience, improves them during use, and runs anywhere"
 readme = "README.md"
 # Upper bound is load-bearing, not cosmetic. uv resolves the project's
@@ -367,6 +367,8 @@ exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = 
 py-modules = [
   "run_agent",
   "model_tools",
+  "registry_transaction",
+  "private_secret_policy",
   "toolsets",
   "batch_runner",
   "trajectory_compressor",

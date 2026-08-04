@@ -28,6 +28,8 @@ import json
 import logging
 import os
 import threading
+import uuid
+from collections import OrderedDict
 from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
 # Errno values that mean "the peer is gone" rather than "the host has a
@@ -80,6 +82,28 @@ _current_transport: contextvars.ContextVar[Optional[Transport]] = (
         default=None,
     )
 )
+
+# Host-private identities for authenticated local transport objects.  The peer
+# cannot choose these values.  Keep strong references only in this bounded LRU
+# so an object-id reuse can never inherit an earlier transport's identity.
+_TRANSPORT_IDENTITIES: OrderedDict[int, tuple[object, str]] = OrderedDict()
+_TRANSPORT_IDENTITIES_LOCK = threading.Lock()
+_TRANSPORT_IDENTITIES_MAX = 4096
+
+
+def _host_transport_identity(transport: Transport) -> str:
+    key = id(transport)
+    with _TRANSPORT_IDENTITIES_LOCK:
+        existing = _TRANSPORT_IDENTITIES.get(key)
+        if existing is not None and existing[0] is transport:
+            _TRANSPORT_IDENTITIES.move_to_end(key)
+            return existing[1]
+        identity = f"local_transport_{uuid.uuid4().hex}"
+        _TRANSPORT_IDENTITIES[key] = (transport, identity)
+        _TRANSPORT_IDENTITIES.move_to_end(key)
+        while len(_TRANSPORT_IDENTITIES) > _TRANSPORT_IDENTITIES_MAX:
+            _TRANSPORT_IDENTITIES.popitem(last=False)
+        return identity
 
 
 def current_transport() -> Optional[Transport]:

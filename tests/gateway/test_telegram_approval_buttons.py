@@ -177,6 +177,74 @@ class TestTelegramExecApproval:
 
 
     @pytest.mark.asyncio
+    async def test_fresh_approval_keyboard_carries_exact_id_and_once_or_deny_only(
+        self, monkeypatch
+    ):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+        buttons = []
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardButton",
+            lambda text, callback_data: buttons.append((text, callback_data)) or text,
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardMarkup", lambda rows: rows
+        )
+
+        await adapter.send_exec_approval(
+            chat_id="12345",
+            command="curl example.test",
+            session_key="agent:main:telegram:group:12345:99",
+            approval_id="fresh-id-17",
+        )
+
+        assert buttons == [
+            ("✅ Allow Once", "fa:approve_once:fresh-id-17"),
+            ("❌ Deny", "fa:deny:fresh-id-17"),
+        ]
+        assert adapter._approval_state["fresh-id-17"] == (
+            "agent:main:telegram:group:12345:99"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fresh_approval_preserves_preview_beyond_legacy_budget(self):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(
+            return_value=SimpleNamespace(message_id=42)
+        )
+        command = "x" * adapter._EA_CMD_BUDGET + "<TAIL-SENTINEL>"
+
+        result = await adapter.send_exec_approval(
+            chat_id="12345",
+            command=command,
+            session_key="agent:main:telegram:group:12345:99",
+            approval_id="fresh-id-long-preview",
+        )
+
+        assert result.success is True
+        sent_text = adapter._bot.send_message.call_args.kwargs["text"]
+        assert f"<pre>{'x' * adapter._EA_CMD_BUDGET}&lt;TAIL-SENTINEL&gt;</pre>" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_legacy_approval_keeps_existing_preview_budget(self):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(
+            return_value=SimpleNamespace(message_id=42)
+        )
+        command = "x" * adapter._EA_CMD_BUDGET + "TAIL-SENTINEL"
+
+        result = await adapter.send_exec_approval(
+            chat_id="12345",
+            command=command,
+            session_key="agent:main:telegram:group:12345:99",
+        )
+
+        assert result.success is True
+        sent_text = adapter._bot.send_message.call_args.kwargs["text"]
+        assert f"<pre>{'x' * adapter._EA_CMD_BUDGET}...</pre>" in sent_text
+        assert "TAIL-SENTINEL" not in sent_text
+
+    @pytest.mark.asyncio
     async def test_send_update_prompt_escapes_dynamic_prompt(self):
         adapter = _make_adapter()
         sent = {}
@@ -239,6 +307,67 @@ class TestTelegramApprovalCallback:
 
         assert "12345" not in adapter._typing_paused
 
+    @pytest.mark.asyncio
+    async def test_legacy_callback_binds_distinct_trusted_response_context(
+        self,
+    ):
+        from agent.trusted_interaction import (
+            get_current_trusted_interaction,
+        )
+        from gateway.run import GatewayRunner
+
+        adapter = _make_adapter()
+        session_key = "agent:main:telegram:group:12345:99"
+        adapter._approval_state[7] = session_key
+        runner = object.__new__(GatewayRunner)
+        runner.session_store = MagicMock()
+        runner.session_store.peek_session_id.return_value = "server-session-7"
+        runner._active_profile_name = lambda: "default"
+        runner._profile_name_for_source = lambda source: "default"
+        adapter.gateway_runner = runner
+
+        query = AsyncMock()
+        query.id = "callback-query-legacy-7"
+        query.data = "ea:once:7"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "supergroup"
+        query.message.message_thread_id = 99
+        query.from_user = MagicMock(id=12345, first_name="Operator")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        observed = []
+
+        def resolve(_session_key, _choice):
+            observed.append(get_current_trusted_interaction())
+            return 1
+
+        with patch.dict(
+            os.environ,
+            {"TELEGRAM_ALLOWED_USERS": "12345"},
+            clear=False,
+        ):
+            with patch(
+                "tools.approval.resolve_gateway_approval",
+                side_effect=resolve,
+            ):
+                await adapter._handle_callback_query(
+                    MagicMock(callback_query=query),
+                    MagicMock(),
+                )
+
+        assert len(observed) == 1
+        interaction = observed[0]
+        assert interaction is not None
+        assert interaction.surface == "gateway_approval"
+        assert interaction.actor_id == "12345"
+        assert interaction.chat_id == "12345"
+        assert interaction.thread_id == "99"
+        assert interaction.message_id == "callback-query-legacy-7"
+        assert interaction.session_key == session_key
+        assert interaction.session_id == "server-session-7"
+        assert get_current_trusted_interaction() is None
+
 
     @pytest.mark.asyncio
     async def test_approval_callback_escapes_dynamic_user_name(self):
@@ -268,6 +397,173 @@ class TestTelegramApprovalCallback:
         assert "Alice\\_Bob" in edit_kwargs["text"]
         assert "Approved once" in edit_kwargs["text"]
 
+
+    @pytest.mark.asyncio
+    async def test_fresh_callback_derives_authenticated_responder_after_authorization(
+        self, monkeypatch
+    ):
+        from tools import fresh_approval
+
+        coordinator = fresh_approval.FreshApprovalCoordinator()
+        monkeypatch.setattr(fresh_approval, "_DEFAULT_COORDINATOR", coordinator)
+        binding = fresh_approval.ConversationBinding(
+            profile_id="work",
+            platform="telegram",
+            channel_id="telegram-account-primary",
+            chat_id="12345",
+            session_key="agent:main:telegram:group:12345:99",
+            session_id="agent:main:telegram:group:12345:99",
+            thread_id="99",
+            actor_id="12345",
+        )
+        subject = fresh_approval.InvocationSubject(
+            invocation_id="invocation-telegram-1",
+            tool_call_id="tool-call-telegram-1",
+            turn_id="turn-telegram-1",
+            origin_message_id="origin-message-1",
+            args_hash="args-telegram-1",
+            proposal_hash="proposal-telegram-1",
+            conversation=binding,
+        )
+        request = coordinator.request(subject, ttl_seconds=30)
+        adapter = _make_adapter()
+        adapter._hermes_profile_id = "work"
+        adapter._approval_state[request.approval_id] = binding.session_id
+        original_build_source = adapter.build_source
+
+        def build_scoped_source(**kwargs):
+            return original_build_source(
+                **kwargs,
+                scope_id="telegram-account-primary",
+            )
+
+        monkeypatch.setattr(adapter, "build_source", build_scoped_source)
+
+        query = AsyncMock()
+        query.id = "callback-query-22"
+        query.data = f"fa:approve_once:{request.approval_id}"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "supergroup"
+        query.message.message_thread_id = 99
+        query.from_user = MagicMock()
+        query.from_user.id = 12345
+        query.from_user.first_name = "Operator"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock(callback_query=query)
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "12345"}, clear=False):
+            await adapter._handle_callback_query(update, MagicMock())
+
+        resolution = coordinator.await_resolution(request.approval_id, timeout=0)
+        assert resolution.outcome == "approved"
+        responder = resolution.evidence.responder
+        assert responder.assurance == "telegram_authenticated"
+        assert responder.principal_id == "12345"
+        assert responder.binding == binding
+        assert responder.binding.channel_id != responder.binding.chat_id
+        assert responder.inbound_id == "callback-query-22"
+
+    @pytest.mark.asyncio
+    async def test_fresh_callback_rejects_unauthorized_actor_without_resolving(
+        self, monkeypatch
+    ):
+        from tools import fresh_approval
+
+        coordinator = fresh_approval.FreshApprovalCoordinator()
+        monkeypatch.setattr(fresh_approval, "_DEFAULT_COORDINATOR", coordinator)
+        binding = fresh_approval.ConversationBinding(
+            profile_id="default",
+            platform="telegram",
+            channel_id="12345",
+            chat_id="12345",
+            session_key="telegram-session",
+            session_id="telegram-session",
+            thread_id=None,
+            actor_id="111",
+        )
+        subject = fresh_approval.InvocationSubject(
+            invocation_id="invocation-telegram-2",
+            tool_call_id="tool-call-telegram-2",
+            turn_id="turn-telegram-2",
+            origin_message_id="origin-message-2",
+            args_hash="args-telegram-2",
+            proposal_hash="proposal-telegram-2",
+            conversation=binding,
+        )
+        request = coordinator.request(subject, ttl_seconds=30)
+        adapter = _make_adapter()
+        adapter._approval_state[request.approval_id] = binding.session_id
+
+        query = AsyncMock()
+        query.id = "callback-query-unauthorized"
+        query.data = f"fa:approve_once:{request.approval_id}"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.message.message_thread_id = None
+        query.from_user = MagicMock(id=222, first_name="Mallory")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock(callback_query=query)
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "111"}, clear=False):
+            await adapter._handle_callback_query(update, MagicMock())
+
+        assert coordinator.await_resolution(request.approval_id, timeout=0) is None
+        assert request.approval_id in adapter._approval_state
+        assert "not authorized" in query.answer.call_args.kwargs["text"].lower()
+
+    @pytest.mark.asyncio
+    async def test_fresh_callback_rejects_event_session_binding_mismatch(
+        self, monkeypatch
+    ):
+        from tools import fresh_approval
+
+        coordinator = fresh_approval.FreshApprovalCoordinator()
+        monkeypatch.setattr(fresh_approval, "_DEFAULT_COORDINATOR", coordinator)
+        binding = fresh_approval.ConversationBinding(
+            profile_id="default",
+            platform="telegram",
+            channel_id="12345",
+            chat_id="12345",
+            thread_id="99",
+            session_key="agent:main:telegram:group:12345:99",
+            session_id="agent:main:telegram:group:12345:99",
+            actor_id="12345",
+        )
+        subject = fresh_approval.InvocationSubject(
+            invocation_id="invocation-telegram-mismatch",
+            tool_call_id="tool-call-telegram-mismatch",
+            turn_id="turn-telegram-mismatch",
+            origin_message_id="origin-telegram-mismatch",
+            args_hash="args-telegram-mismatch",
+            proposal_hash="proposal-telegram-mismatch",
+            conversation=binding,
+        )
+        request = coordinator.request(subject, ttl_seconds=30)
+        adapter = _make_adapter()
+        adapter._approval_state[request.approval_id] = "different-session"
+
+        query = AsyncMock()
+        query.id = "callback-query-mismatch"
+        query.data = f"fa:approve_once:{request.approval_id}"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "supergroup"
+        query.message.message_thread_id = 99
+        query.from_user = MagicMock(id=12345, first_name="Operator")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock(callback_query=query)
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "12345"}, clear=False):
+            await adapter._handle_callback_query(update, MagicMock())
+
+        assert coordinator.await_resolution(request.approval_id, timeout=0) is None
+        assert request.approval_id in adapter._approval_state
+        assert "rejected" in query.answer.call_args.kwargs["text"].lower()
 
     @pytest.mark.asyncio
     async def test_update_prompt_callback_not_affected(self, tmp_path):

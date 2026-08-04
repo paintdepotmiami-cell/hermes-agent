@@ -22,6 +22,7 @@ import { $gateway } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
 import {
   type ApprovalRequest,
+  approvalRespondParams,
   clearApprovalRequest,
   registerApprovalInlineAnchor,
   sessionApprovalInlineVisible,
@@ -142,10 +143,10 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
       setSubmitting(choice)
 
       try {
-        await gateway.request<{ resolved?: boolean }>('approval.respond', {
-          choice,
-          session_id: request.sessionId ?? undefined
-        })
+        await gateway.request<{ resolved?: boolean }>(
+          'approval.respond',
+          approvalRespondParams(request, choice)
+        )
         triggerHaptic(choice === 'deny' ? 'cancel' : 'submit')
         clearApprovalRequest(request.sessionId)
       } catch (error) {
@@ -153,7 +154,7 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
         setSubmitting(null)
       }
     },
-    [busy, copy.gatewayDisconnected, copy.sendFailed, gateway, request.sessionId]
+    [busy, copy.gatewayDisconnected, copy.sendFailed, gateway, request]
   )
 
   // ⌘/Ctrl+Enter → Run, Esc → Reject.

@@ -14,42 +14,58 @@ from hermes_cli.dashboard_auth.base import (
     DashboardAuthProvider,
     assert_protocol_compliance,
 )
+from registry_transaction import MappingRegistry, RegistryTransactionSurface
 
 _log = logging.getLogger(__name__)
-_lock = threading.Lock()
+_lock = threading.RLock()
 _providers: dict[str, DashboardAuthProvider] = {}
+_registry_state = MappingRegistry("dashboard", _providers, _lock)
 
 
-def register_provider(provider: DashboardAuthProvider) -> None:
-    """Register a provider.
+def _register_provider_in(
+    target: MappingRegistry,
+    provider: DashboardAuthProvider,
+) -> str:
+    """Validate and register into a live registry or isolated transaction view.
 
     Raises:
         TypeError: on protocol violation.
         ValueError: if a provider with the same name is already registered.
     """
     assert_protocol_compliance(type(provider))
-    with _lock:
-        if provider.name in _providers:
-            raise ValueError(
-                f"dashboard-auth provider already registered: {provider.name!r}"
-            )
-        _providers[provider.name] = provider
+    name = provider.name
+    display_name = provider.display_name
+    added, _existing = target.put(name, provider, replace=False)
+    if not added:
+        raise ValueError(
+            f"dashboard-auth provider already registered: {name!r}"
+        )
     _log.info(
         "dashboard-auth: registered provider %r (%s)",
-        provider.name, provider.display_name,
+        name, display_name,
     )
+    return name
+
+
+def register_provider(provider: DashboardAuthProvider) -> None:
+    """Register a provider."""
+    _register_provider_in(_registry_state, provider)
+
+
+_plugin_transaction = RegistryTransactionSurface(
+    _registry_state,
+    _register_provider_in,
+)
 
 
 def get_provider(name: str) -> Optional[DashboardAuthProvider]:
     """Return the registered provider for ``name``, or None if unknown."""
-    with _lock:
-        return _providers.get(name)
+    return _registry_state.get(name)
 
 
 def list_providers() -> List[DashboardAuthProvider]:
     """All registered providers, in registration order."""
-    with _lock:
-        return list(_providers.values())
+    return _registry_state.values()
 
 
 def list_token_providers() -> List[DashboardAuthProvider]:
@@ -62,8 +78,8 @@ def list_token_providers() -> List[DashboardAuthProvider]:
     no token provider is registered — a token-authable route then fails
     closed (401), never open.
     """
-    with _lock:
-        return [p for p in _providers.values() if getattr(p, "supports_token", False)]
+    providers = _registry_state.values()
+    return [p for p in providers if getattr(p, "supports_token", False)]
 
 
 def list_session_providers() -> List[DashboardAuthProvider]:
@@ -71,11 +87,10 @@ def list_session_providers() -> List[DashboardAuthProvider]:
     sessions). The login page, /auth/login, and the gate's verify/refresh loops
     consult only these. Mirror of list_token_providers.
     """
-    with _lock:
-        return [p for p in _providers.values() if getattr(p, "supports_session", True)]
+    providers = _registry_state.values()
+    return [p for p in providers if getattr(p, "supports_session", True)]
 
 
 def clear_providers() -> None:
     """Test-only: drop all registrations."""
-    with _lock:
-        _providers.clear()
+    _registry_state.clear()

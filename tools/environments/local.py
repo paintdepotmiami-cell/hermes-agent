@@ -453,12 +453,23 @@ def _inject_session_context_env(env: dict) -> None:
             env.pop(var_name, None)
 
 
+def _final_scrub_private_secret_env(env: dict[str, str]) -> dict[str, str]:
+    """Apply the host-owned plugin private-name policy at a final boundary."""
+    from private_secret_policy import scrub_private_secret_env
+
+    return scrub_private_secret_env(env)
+
+
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:
-        from tools.env_passthrough import is_env_passthrough as _is_passthrough
+        from tools.env_passthrough import (
+            is_env_passthrough as _is_passthrough,
+            resolve_passthrough_value as _resolve_passthrough_value,
+        )
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
+        _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
 
     sanitized: dict[str, str] = {}
 
@@ -467,8 +478,12 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
             continue
         if _is_hermes_internal_secret(key):
             continue
-        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
-            sanitized[key] = value
+        passthrough = _is_passthrough(key)
+        if key in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+            continue
+        resolved = _resolve_passthrough_value(key, value) if passthrough else value
+        if resolved is not None:
+            sanitized[key] = resolved
 
     for key, value in (extra_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
@@ -478,8 +493,13 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
             sanitized[real_key] = value
         elif _is_hermes_internal_secret(key):
             continue
-        elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
-            sanitized[key] = value
+        else:
+            passthrough = _is_passthrough(key)
+            if key in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+                continue
+            resolved = _resolve_passthrough_value(key, value) if passthrough else value
+            if resolved is not None:
+                sanitized[key] = resolved
 
     _inject_context_hermes_home(sanitized)
 
@@ -497,7 +517,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
 
     sanitized = _scrub_delegated_child_kanban_env(sanitized)
 
-    return sanitized
+    return _final_scrub_private_secret_env(sanitized)
 
 
 def _scrub_delegated_child_kanban_env(env: dict[str, str]) -> dict[str, str]:
@@ -640,7 +660,7 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # still see the parent's HERMES_HOME but lose the DB mutation guard.
     env = _scrub_delegated_child_kanban_env(env)
 
-    return env
+    return _final_scrub_private_secret_env(env)
 
 
 def build_subprocess_env(
@@ -673,19 +693,22 @@ def build_subprocess_env(
       home propagation is inherent — ``inherit_profile_home`` is ignored
       (always applied), exactly matching today's sanitize semantics.
     * ``scrub_secrets=False`` — preserve the base env content byte-for-byte
-      (no key is removed).  Use for children that intentionally receive
-      secrets (git credential flows, ``bws``/``op`` secret CLIs) or where
-      scrubbing could change behavior.  The site is still a win: it becomes
-      grep-able and future-fixable.
+      except for names declared private by an enabled plugin, which are always
+      removed at the final boundary. Use for children that intentionally
+      receive other secrets (git credential flows, ``bws``/``op`` secret CLIs)
+      or where general credential scrubbing could change behavior. The site is
+      still a win: it becomes grep-able and future-fixable.
     * ``inherit_profile_home`` — on the non-scrub path, when True, bridge the
       context-local Hermes home override into ``HERMES_HOME`` and apply the
       subprocess HOME contract (``hermes_constants.apply_subprocess_home_env``).
-      Pass False to keep the inherited env untouched (exact legacy
-      ``os.environ.copy()`` behavior).
-    * ``extra`` — applied **last** on the non-scrub path so explicit caller
-      overrides (e.g. a session-scoped ``HERMES_HOME``) always win.  On the
-      scrub path it is forwarded as ``_sanitize_subprocess_env``'s
-      ``extra_env`` (same force-prefix / blocklist handling as today).
+      Pass False to retain the legacy HOME behavior; plugin-private names are
+      still removed.
+    * ``extra`` — applied last on the non-scrub path; explicit caller
+      overrides (e.g. a session-scoped ``HERMES_HOME``) win unless the name is
+      plugin-private. On the scrub path it is forwarded as
+      ``_sanitize_subprocess_env``'s ``extra_env`` (same force-prefix /
+      blocklist handling as today), followed by the same final private-name
+      scrub.
     """
     if scrub_secrets:
         # _sanitize_subprocess_env already performs HERMES_HOME override
@@ -703,7 +726,7 @@ def build_subprocess_env(
         apply_subprocess_home_env(env)
     if extra:
         env.update(extra)
-    return env
+    return _final_scrub_private_secret_env(env)
 
 
 def _find_bash() -> str:
@@ -1127,6 +1150,34 @@ def _prepend_hermes_bin_dir(existing_path: str) -> str:
     return sep.join([bin_dir, *entries])
 
 
+def _managed_runtime_path_entries() -> list[str]:
+    """Return existing Hermes-managed runtime dirs for the terminal subshell PATH.
+
+    The terminal tool spawns a subshell whose PATH is the agent process's PATH
+    plus ``_SANE_PATH``. Neither carries the runtimes Hermes installs for
+    itself, so on a machine where Hermes provisioned its own toolchain a
+    command the agent runs resolves a system copy instead — or nothing at all:
+
+    - ``$HERMES_HOME/node`` (+ ``/bin``) — installed to satisfy the desktop and
+      browser toolchain. ``tools/browser_tool.py`` already does this for its own
+      subprocesses; the agent's shell deserves the same.
+    - ``$HERMES_HOME/bin`` — the managed ``uv``. ``install.sh`` writes it there
+      and nothing has ever put that directory on PATH, so an install whose only
+      uv is the managed one looks uv-less to both the agent and the model.
+
+    Resolved per call rather than cached in a module constant because
+    ``get_hermes_home()`` is profile-scoped and a managed tree can appear
+    mid-process (``heal_hermes_managed_node``, a first browser install).
+    """
+    try:
+        from hermes_constants import get_hermes_home, iter_hermes_node_dirs
+
+        candidates = [*iter_hermes_node_dirs(), get_hermes_home() / "bin"]
+        return [str(d) for d in candidates if d.is_dir()]
+    except Exception:
+        return []
+
+
 def _append_missing_sane_path_entries(existing_path: str) -> str:
     """Return a normalised POSIX PATH with missing sane entries appended.
 
@@ -1144,6 +1195,11 @@ def _append_missing_sane_path_entries(existing_path: str) -> str:
     - **Duplicates are collapsed** (first occurrence wins), so a caller PATH
       that already contains repeats is not propagated verbatim.
 
+    Hermes-managed runtime dirs are appended alongside the sane entries, not
+    prepended: a tool the user deliberately put on their own PATH still wins,
+    and the managed one only fills the gap where there would otherwise be
+    nothing.
+
     For a well-formed PATH (no empties, no duplicates) the leading segment is
     byte-identical to the input and ordering is preserved; only the missing
     sane entries are appended. On Windows this is a no-op passthrough (the
@@ -1153,6 +1209,9 @@ def _append_missing_sane_path_entries(existing_path: str) -> str:
         return existing_path
 
     sane_entries = [entry for entry in _SANE_PATH.split(":") if entry]
+    sane_entries.extend(
+        entry for entry in _managed_runtime_path_entries() if entry not in sane_entries
+    )
     if not existing_path:
         return ":".join(sane_entries)
 
@@ -1219,9 +1278,13 @@ def _path_env_key(run_env: dict) -> str | None:
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
     try:
-        from tools.env_passthrough import is_env_passthrough as _is_passthrough
+        from tools.env_passthrough import (
+            is_env_passthrough as _is_passthrough,
+            resolve_passthrough_value as _resolve_passthrough_value,
+        )
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
+        _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
 
     merged = dict(os.environ | env)
     run_env = {}
@@ -1233,8 +1296,13 @@ def _make_run_env(env: dict) -> dict:
             run_env[real_key] = v
         elif _is_hermes_internal_secret(k):
             continue
-        elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
-            run_env[k] = v
+        else:
+            passthrough = _is_passthrough(k)
+            if k in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+                continue
+            value = _resolve_passthrough_value(k, v) if passthrough else v
+            if value is not None:
+                run_env[k] = value
     path_key = _path_env_key(run_env)
     if path_key is not None:
         new_path = _append_missing_sane_path_entries(run_env.get(path_key, ""))
@@ -1267,7 +1335,7 @@ def _make_run_env(env: dict) -> dict:
 
     run_env = _scrub_delegated_child_kanban_env(run_env)
 
-    return run_env
+    return _final_scrub_private_secret_env(run_env)
 
 
 def _read_terminal_shell_init_config() -> tuple[list[str], bool]:
@@ -1360,6 +1428,8 @@ class LocalEnvironment(BaseEnvironment):
     Session snapshot preserves env vars across calls.
     CWD persists via file-based read after each command.
     """
+
+    _profile_scoped_passthrough = True
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         cwd = _resolve_local_initial_cwd(cwd)

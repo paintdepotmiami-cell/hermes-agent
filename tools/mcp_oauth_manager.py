@@ -16,8 +16,8 @@ instances and coordinates:
   is warranted.
 
 Replaces what used to be scattered across eight call sites in `mcp_oauth.py`,
-`mcp_tool.py`, and `hermes_cli/mcp_config.py`. This module is the ONLY place
-that instantiates the MCP SDK's `OAuthClientProvider` — all other code paths
+`mcp_tool.py`, and `hermes_cli/mcp_config.py`. This module is the only place
+that constructs both browser and client-credentials OAuth providers; all paths
 go through `get_manager()`.
 
 Design reference:
@@ -38,11 +38,181 @@ import asyncio
 import logging
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
+
+import httpx
 
 logger = logging.getLogger(__name__)
+
+
+class OAuthClientCredentialsError(RuntimeError):
+    """A sanitized, fail-closed client-credentials configuration/runtime error."""
+
+
+class ClientCredentialsAuth(httpx.Auth):
+    """In-memory OAuth client-credentials provider for autonomous MCP agents."""
+
+    def __init__(
+        self,
+        *,
+        server_name: str,
+        token_endpoint: str,
+        client_id: str,
+        client_secret: str,
+        audience: str,
+        scope: str,
+        refresh_skew: float = 60.0,
+        timeout: float = 15.0,
+        clock: Any = time.monotonic,
+        client_factory: Any = None,
+    ) -> None:
+        self._server_name = server_name
+        self._token_endpoint = token_endpoint
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._audience = audience
+        self._scope = scope
+        self._refresh_skew = max(0.0, float(refresh_skew))
+        self._timeout = max(1.0, float(timeout))
+        self._clock = clock
+        self._client_factory = client_factory or httpx.AsyncClient
+        self._access_token: str | None = None
+        self._expires_at = 0.0
+        self._token_lock = asyncio.Lock()
+
+    async def get_access_token(self) -> str:
+        """Return a cached token or obtain one, deduplicating concurrent fetches."""
+        if self._token_is_current():
+            return self._access_token  # type: ignore[return-value]
+
+        async with self._token_lock:
+            if self._token_is_current():
+                return self._access_token  # type: ignore[return-value]
+            return await self._request_access_token()
+
+    def _token_is_current(self) -> bool:
+        return bool(
+            self._access_token
+            and self._expires_at > self._clock() + self._refresh_skew
+        )
+
+    async def _request_access_token(self) -> str:
+        data = {
+            "grant_type": "client_credentials",
+            "client_id": self._client_id,
+            "client_secret": self._client_secret,
+            "audience": self._audience,
+            "scope": self._scope,
+        }
+        try:
+            async with self._client_factory(
+                follow_redirects=False,
+                timeout=self._timeout,
+            ) as client:
+                response = await client.post(self._token_endpoint, data=data)
+        except Exception as exc:
+            raise OAuthClientCredentialsError(
+                f"MCP OAuth '{self._server_name}': token request failed "
+                f"({type(exc).__name__})"
+            ) from None
+
+        if response.status_code != 200:
+            raise OAuthClientCredentialsError(
+                f"MCP OAuth '{self._server_name}': token endpoint returned "
+                f"HTTP {response.status_code}"
+            )
+
+        try:
+            payload = response.json()
+            access_token = payload["access_token"]
+            token_type = payload["token_type"]
+            expires_in = float(payload["expires_in"])
+        except (KeyError, TypeError, ValueError):
+            raise OAuthClientCredentialsError(
+                f"MCP OAuth '{self._server_name}': token endpoint returned "
+                "an invalid response"
+            ) from None
+
+        if (
+            not isinstance(access_token, str)
+            or not access_token
+            or not isinstance(token_type, str)
+            or token_type.lower() != "bearer"
+            or expires_in <= 0
+        ):
+            raise OAuthClientCredentialsError(
+                f"MCP OAuth '{self._server_name}': token endpoint returned "
+                "an invalid response"
+            )
+
+        self._access_token = access_token
+        self._expires_at = self._clock() + expires_in
+        return access_token
+
+    async def invalidate_access_token(
+        self, failed_access_token: str | None = None
+    ) -> bool:
+        """Invalidate the matching cached token so the next request renews it."""
+        async with self._token_lock:
+            if failed_access_token is None or failed_access_token == self._access_token:
+                self._access_token = None
+                self._expires_at = 0.0
+        return True
+
+    async def async_auth_flow(self, request: httpx.Request):
+        """Attach a bearer token and retry once with a fresh token on 401."""
+        access_token = await self.get_access_token()
+        request.headers["Authorization"] = f"Bearer {access_token}"
+        response = yield request
+
+        if response.status_code == 401:
+            await self.invalidate_access_token(access_token)
+            access_token = await self.get_access_token()
+            request.headers["Authorization"] = f"Bearer {access_token}"
+            yield request
+
+
+def _required_client_credentials_value(cfg: dict, field: str) -> str:
+    value = cfg.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise OAuthClientCredentialsError(
+            f"MCP OAuth client_credentials requires non-empty '{field}'"
+        )
+    return value.strip()
+
+
+def _build_client_credentials_provider(
+    server_name: str,
+    cfg: dict,
+) -> ClientCredentialsAuth:
+    token_endpoint = _required_client_credentials_value(cfg, "token_endpoint")
+    parsed_endpoint = urlsplit(token_endpoint)
+    if (
+        parsed_endpoint.scheme.lower() != "https"
+        or not parsed_endpoint.hostname
+        or parsed_endpoint.username is not None
+        or parsed_endpoint.password is not None
+        or parsed_endpoint.fragment
+    ):
+        raise OAuthClientCredentialsError(
+            "MCP OAuth client_credentials 'token_endpoint' must be an HTTPS "
+            "URL without credentials or fragments"
+        )
+
+    return ClientCredentialsAuth(
+        server_name=server_name,
+        token_endpoint=token_endpoint,
+        client_id=_required_client_credentials_value(cfg, "client_id"),
+        client_secret=_required_client_credentials_value(cfg, "client_secret"),
+        audience=_required_client_credentials_value(cfg, "audience"),
+        scope=_required_client_credentials_value(cfg, "scope"),
+        refresh_skew=cfg.get("refresh_skew", 60),
+        timeout=cfg.get("timeout", 15),
+    )
 
 
 def _same_endpoint(a: str, b: str) -> bool:
@@ -476,19 +646,24 @@ class MCPOAuthManager:
         Returns None if the MCP SDK's OAuth support is unavailable.
         """
         key = self._key(server_name)
+        requested_config = dict(oauth_config or {})
         with self._entries_lock:
             entry = self._entries.get(key)
-            if entry is not None and entry.server_url != server_url:
+            if entry is not None and (
+                entry.server_url != server_url
+                or dict(entry.oauth_config or {}) != requested_config
+            ):
                 logger.info(
-                    "MCP OAuth '%s': URL changed from %s to %s, discarding cache",
-                    server_name, entry.server_url, server_url,
+                    "MCP OAuth '%s': connection configuration changed, "
+                    "discarding cache",
+                    server_name,
                 )
                 entry = None
 
             if entry is None:
                 entry = _ProviderEntry(
                     server_url=server_url,
-                    oauth_config=oauth_config,
+                    oauth_config=requested_config,
                 )
                 self._entries[key] = entry
 
@@ -523,6 +698,16 @@ class MCPOAuthManager:
 
         Returns None if the MCP SDK's OAuth support is unavailable.
         """
+        cfg = dict(entry.oauth_config or {})
+        grant_type = cfg.get("grant_type")
+        if grant_type == "client_credentials":
+            return _build_client_credentials_provider(server_name, cfg)
+        if grant_type not in (None, "authorization_code"):
+            raise OAuthClientCredentialsError(
+                f"MCP OAuth '{server_name}': unsupported grant_type "
+                f"{grant_type!r}"
+            )
+
         if _HERMES_PROVIDER_CLS is None:
             logger.warning(
                 "MCP OAuth '%s': SDK auth module unavailable", server_name,
@@ -545,7 +730,6 @@ class MCPOAuthManager:
         if not _OAUTH_AVAILABLE:
             return None
 
-        cfg = dict(entry.oauth_config or {})
         from tools.mcp_oauth import apply_oauth_provider_defaults
 
         apply_oauth_provider_defaults(
@@ -653,6 +837,8 @@ class MCPOAuthManager:
         entry = self._entries.get(self._key(server_name, hermes_home))
         if entry is None or entry.provider is None:
             return False
+        if isinstance(entry.provider, ClientCredentialsAuth):
+            return False
 
         async with entry.lock:
             tokens_path = _get_token_dir(hermes_home) / f"{_safe_filename(server_name)}.json"
@@ -725,6 +911,14 @@ class MCPOAuthManager:
                         # in-place, let the caller retry. The SDK's httpx.Auth
                         # flow will issue the refresh on the next request.
                         provider = entry.provider
+                        invalidate_fn = getattr(
+                            provider, "invalidate_access_token", None
+                        )
+                        if callable(invalidate_fn):
+                            await invalidate_fn(failed_access_token)
+                            if not pending.done():
+                                pending.set_result(True)
+                            return
                         ctx = getattr(provider, "context", None)
                         can_refresh = False
                         if ctx is not None:

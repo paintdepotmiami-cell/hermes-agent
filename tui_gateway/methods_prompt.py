@@ -123,10 +123,23 @@ def _(rid, params: dict) -> dict:
         )
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
+    # A local peer may only authenticate interaction provenance for the live
+    # runtime session already owned by that exact server-side transport.  The
+    # client-supplied session_id selects a candidate; transport identity is the
+    # authority. Direct internal/unit calls with no bound transport retain the
+    # legacy behavior but do not mint trusted provenance.
+    t = current_transport()
+    if t is not None and session.get("transport") is not t:
+        return _err(rid, 4009, "session is not owned by this transport")
+    trusted_interaction = (
+        _issue_local_trusted_interaction(sid, session, t)
+        if t is not None
+        else None
+    )
     # Re-bind to the current client transport for this request. This keeps
     # streaming events on the active websocket even if an earlier disconnect
     # or fallback moved the session transport to stdio.
-    if (t := current_transport()) is not None:
+    if t is not None:
         session["transport"] = t
     while True:
         busy_transport = None
@@ -142,6 +155,7 @@ def _(rid, params: dict) -> dict:
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
+            trusted_interaction=trusted_interaction,
         )
         if busy_response is not None:
             return busy_response
@@ -210,20 +224,48 @@ def _(rid, params: dict) -> dict:
                 len(truncated),
                 ordinal,
             )
-            session["history"] = truncated
-            session["history_version"] = int(session.get("history_version", 0)) + 1
+            # Write-before-memory (mirrors gateway hygiene / manual /compress):
+            # persist the truncated transcript first. If replace_messages fails
+            # after we already rewrote session["history"], the turn still runs
+            # against the short list while state.db keeps the old tail. The
+            # agent flush is append-only for history-dict identities, so the
+            # new exchange is appended on top of the "undone" turns — durable
+            # zombie history on resume, and the edit/regenerate never sticks.
+            # Fail closed: refuse the turn and leave memory/DB unchanged.
             if (db := _get_db()) is not None:
                 try:
                     db.replace_messages(session["session_key"], truncated)
                 except Exception as exc:
-                    print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
+                    logger.error(
+                        "prompt.submit: replace_messages failed for session %s "
+                        "(ordinal=%d); refusing turn so memory and DB stay "
+                        "aligned: %s",
+                        sid,
+                        ordinal,
+                        exc,
+                        exc_info=True,
+                    )
+                    return _err(
+                        rid,
+                        5008,
+                        f"failed to persist history truncation: {exc}",
+                    )
+            session["history"] = truncated
+            session["history_version"] = int(session.get("history_version", 0)) + 1
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
+        _publish_local_trusted_interaction(trusted_interaction)
 
     if turn_isolation:
-        isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
+        isolated_response = _submit_prompt_to_compute_host(
+            rid,
+            sid,
+            session,
+            text,
+            trusted_interaction=trusted_interaction,
+        )
         if not isolated_response.get("error"):
             return isolated_response
         logger.warning(
@@ -247,6 +289,7 @@ def _(rid, params: dict) -> dict:
             session["running"] = False
             session["last_active"] = time.time()
             _clear_inflight_turn(session)
+        _clear_local_trusted_interaction(interaction=trusted_interaction)
         if is_disk_full_error(exc):
             return _err(
                 rid,
@@ -280,6 +323,7 @@ def _(rid, params: dict) -> dict:
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
+            _clear_local_trusted_interaction(interaction=trusted_interaction)
             _emit("session.info", sid, _session_info(session.get("agent"), session))
             return
         with session["history_lock"]:
@@ -301,8 +345,21 @@ def _(rid, params: dict) -> dict:
                         else "Session no longer running before the agent was ready"
                     },
                 )
+                _clear_local_trusted_interaction(interaction=trusted_interaction)
                 return
-        _run_prompt_submit(rid, sid, session, text)
+        if trusted_interaction is None:
+            # Preserve the established four-argument seam for embedders and
+            # tests that replace _run_prompt_submit. Only authenticated public
+            # transport requests need the provenance extension.
+            _run_prompt_submit(rid, sid, session, text)
+        else:
+            _run_prompt_submit(
+                rid,
+                sid,
+                session,
+                text,
+                trusted_interaction=trusted_interaction,
+            )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
@@ -885,6 +942,98 @@ def _(rid, params: dict) -> dict:
 
 @method("approval.respond")
 def _(rid, params: dict) -> dict:
+    # Fresh requests are exact-ID capabilities. The local client supplies only
+    # the opaque ID and decision; session, assurance, host nonce/time, and the
+    # inbound RPC ID are derived here at the authenticated local backend seam.
+    if "approval_id" in params:
+        if rid is None or not str(rid):
+            return _err(rid, -32600, "fresh approval requires an RPC request ID")
+        unexpected = set(params) - {"approval_id", "decision"}
+        if unexpected:
+            return _err(
+                rid,
+                -32602,
+                "fresh approval accepts only approval_id and decision",
+            )
+        try:
+            from tools.fresh_approval import (
+                ConversationBinding,
+                get_fresh_approval_coordinator,
+            )
+
+            coordinator = get_fresh_approval_coordinator()
+            approval_id = params.get("approval_id")
+            decision = params.get("decision")
+            if not isinstance(approval_id, str) or not approval_id:
+                return _err(rid, -32602, "approval_id must be a non-empty string")
+            if decision not in {"approve_once", "deny"}:
+                return _err(rid, -32602, "decision must be approve_once or deny")
+            request = coordinator.get_request(approval_id)
+            transport = current_transport()
+            if transport is None:
+                raise ValueError("fresh approval requires an authenticated transport")
+            runtime_session_id = request.subject.conversation.session_id
+            with _sessions_lock:
+                session = _sessions.get(runtime_session_id)
+                if session is None or session.get("transport") is not transport:
+                    raise ValueError(
+                        "fresh approval session is not owned by this transport"
+                    )
+                session_key = str(session.get("session_key") or "")
+            if not session_key:
+                raise ValueError("fresh approval session has no durable identity")
+            requested_binding = request.subject.conversation
+            profile_id = str(session.get("profile_id") or "default")
+            source = str(session.get("source") or "desktop")
+            if requested_binding.platform == "local":
+                from tui_gateway.transport import _host_transport_identity
+
+                transport_id = _host_transport_identity(transport)
+                expected_binding = ConversationBinding(
+                    profile_id=profile_id,
+                    platform="local",
+                    channel_id=transport_id,
+                    chat_id=runtime_session_id,
+                    session_key=session_key,
+                    session_id=runtime_session_id,
+                    thread_id=None,
+                    actor_id=transport_id,
+                )
+            else:
+                # Backward-compatible binding for fresh approvals created by
+                # pre-governance local callers.
+                expected_binding = ConversationBinding(
+                    profile_id=profile_id,
+                    platform="local_desktop",
+                    channel_id=source,
+                    chat_id=runtime_session_id,
+                    session_key=session_key,
+                    session_id=runtime_session_id,
+                    thread_id=None,
+                    actor_id=None,
+                )
+            if requested_binding != expected_binding:
+                raise ValueError("fresh approval conversation binding mismatch")
+            responder = coordinator._mint_authenticated_responder_for_host(
+                assurance="local_desktop_session",
+                principal_id=None,
+                binding=requested_binding,
+                inbound_id=str(rid),
+            )
+            resolution = coordinator.resolve(
+                approval_id,
+                decision=decision,
+                responder=responder,
+            )
+            return _ok(
+                rid,
+                {"resolved": True, "outcome": resolution.outcome},
+            )
+        except Exception as e:
+            return _err(rid, 4009, str(e))
+
+    # No approval_id means the established legacy session/FIFO contract. It
+    # deliberately remains responder-less for backward compatibility.
     session, err = _sess(params, rid)
     if err:
         return err

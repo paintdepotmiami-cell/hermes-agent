@@ -38,6 +38,23 @@ def _redact_telegram_error_text(error: object) -> str:
         return "<telegram error redacted>"
 
 
+def _scoped_gate_env(name: str, default: str = "") -> str:
+    """Read a TELEGRAM_*/GATEWAY_* authorization gate env var per-profile.
+
+    Under gateway.multiplex_profiles the process env is first-writer-wins
+    (the YAML→env bridge in ``_apply_yaml_config``), so a raw ``os.getenv``
+    can return ANOTHER profile's allowlist (issue #72348, Telegram mirror).
+    Reads the active profile's secret scope when installed; falls back to
+    ``os.getenv`` outside multiplex — identical single-profile behavior.
+    """
+    try:
+        from gateway.authz_mixin import _platform_gate_env
+
+        return _platform_gate_env(name, default)
+    except Exception:
+        return (os.getenv(name) or default).strip()
+
+
 def _consume_abandoned_task(task: asyncio.Task) -> None:
     """Observe a detached task's terminal exception to avoid noisy loop logs."""
     try:
@@ -834,8 +851,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # Interactive model picker state per chat
         self._model_picker_state: Dict[str, dict] = {}
         self._choice_picker_state: Dict[str, dict] = {}
-        # Approval button state: message_id → session_key
-        self._approval_state: Dict[int, str] = {}
+        # Approval button state: legacy counter or fresh approval_id → session_key
+        self._approval_state: Dict[object, str] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
@@ -947,13 +964,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
 
-        allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
+        allowed_csv = _scoped_gate_env("TELEGRAM_ALLOWED_USERS").strip()
         if not allowed_csv:
             # Fail-closed: no allowlist means deny by default.
             # The runner auth path in _is_user_authorized() handles
             # GATEWAY_ALLOW_ALL_USERS; this fallback must not silently
             # allow everyone (fixes #24457).
-            return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+            return _scoped_gate_env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         return "*" in allowed_ids or normalized_user_id in allowed_ids
 
@@ -1027,7 +1044,7 @@ class TelegramAdapter(BasePlatformAdapter):
             "GATEWAY_ALLOWED_USERS",
             "GATEWAY_ALLOW_ALL_USERS",
         )
-        return any(os.getenv(key, "").strip() for key in keys)
+        return any(_scoped_gate_env(key).strip() for key in keys)
 
     def _should_pass_unauthorized_dm_for_pairing(self, source) -> bool:
         """Return True when an unauthorized DM must still reach gateway pairing.
@@ -1137,7 +1154,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
 
         if authorized is None:
-            allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
+            allowed_csv = _scoped_gate_env("TELEGRAM_ALLOWED_USERS").strip()
             if not allowed_csv:
                 return True
             allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
@@ -4021,7 +4038,20 @@ class TelegramAdapter(BasePlatformAdapter):
                     os.getenv("TELEGRAM_WEBHOOK_HOST", "").strip()
                     or str((self.config.extra or {}).get("webhook_host") or "").strip()
                 )
-                webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+                # Profile-scoped read (adapter startup, Slack pattern
+                # #59739): a scoped read honors the profile's own secret;
+                # only an UNSCOPED read under multiplex (default-profile
+                # startup loop) falls back to the process env, which is that
+                # profile's own value.
+                from agent.secret_scope import (
+                    UnscopedSecretError,
+                    get_secret,
+                )
+
+                try:
+                    webhook_secret = (get_secret("TELEGRAM_WEBHOOK_SECRET") or "").strip()
+                except UnscopedSecretError:
+                    webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
                 if not webhook_secret:
                     raise RuntimeError(
                         "TELEGRAM_WEBHOOK_SECRET is required when "
@@ -5399,41 +5429,73 @@ class TelegramAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        approval_id: Optional[str] = None,
     ) -> SendResult:
         """Send an inline-keyboard approval prompt with interactive buttons.
 
-        The buttons call ``resolve_gateway_approval()`` to unblock the waiting
-        agent thread — same mechanism as the text ``/approve`` flow.
+        Legacy buttons call ``resolve_gateway_approval()``. When an exact
+        ``approval_id`` is supplied, the two fresh buttons instead submit
+        authenticated responder evidence to ``FreshApprovalCoordinator``.
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
         try:
-            text = self._format_exec_approval(command, description, smart_denied)
+            text = self._format_exec_approval(
+                command,
+                description,
+                smart_denied,
+                # The fresh approval grant is bound to the exact preview. If
+                # the resulting Telegram message is too large, the send fails
+                # closed and the gateway's chunking text fallback presents the
+                # complete preview with the exact-ID reply instructions.
+                truncate_command=not bool(approval_id),
+            )
 
             # Resolve thread context for thread replies
             thread_id = self._metadata_thread_id(metadata)
 
-            # We'll use the message_id as part of callback_data to look up session_key
-            # Send a placeholder first, then update — or use a counter.
-            # Simpler: use a monotonic counter to generate short IDs.
-            import itertools
-            if not hasattr(self, "_approval_counter"):
-                self._approval_counter = itertools.count(1)
-            approval_id = next(self._approval_counter)
+            if approval_id:
+                state_id: object = approval_id
+                buttons = [
+                    InlineKeyboardButton(
+                        "✅ Allow Once",
+                        callback_data=f"fa:approve_once:{approval_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Deny",
+                        callback_data=f"fa:deny:{approval_id}",
+                    ),
+                ]
+            else:
+                # Keep the established session/FIFO approval shape unchanged.
+                import itertools
 
-            buttons = [
-                InlineKeyboardButton("✅ Allow Once", callback_data=f"ea:once:{approval_id}")
-            ]
-            if not smart_denied and allow_session:
-                buttons.append(
-                    InlineKeyboardButton("✅ Session", callback_data=f"ea:session:{approval_id}")
-                )
-                if allow_permanent:
-                    buttons.append(
-                        InlineKeyboardButton("✅ Always", callback_data=f"ea:always:{approval_id}")
+                if not hasattr(self, "_approval_counter"):
+                    self._approval_counter = itertools.count(1)
+                state_id = next(self._approval_counter)
+                buttons = [
+                    InlineKeyboardButton(
+                        "✅ Allow Once", callback_data=f"ea:once:{state_id}"
                     )
-            buttons.append(InlineKeyboardButton("❌ Deny", callback_data=f"ea:deny:{approval_id}"))
+                ]
+                if not smart_denied and allow_session:
+                    buttons.append(
+                        InlineKeyboardButton(
+                            "✅ Session", callback_data=f"ea:session:{state_id}"
+                        )
+                    )
+                    if allow_permanent:
+                        buttons.append(
+                            InlineKeyboardButton(
+                                "✅ Always", callback_data=f"ea:always:{state_id}"
+                            )
+                        )
+                buttons.append(
+                    InlineKeyboardButton(
+                        "❌ Deny", callback_data=f"ea:deny:{state_id}"
+                    )
+                )
             # Pair into rows (2x2 for the full set) so labels stay readable on
             # mobile — a single 4-button row truncates to "Allo… / Ses… / …".
             rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
@@ -5461,7 +5523,7 @@ class TelegramAdapter(BasePlatformAdapter):
             msg = await self._send_message_with_thread_fallback(**kwargs)
 
             # Store session_key keyed by approval_id for the callback handler
-            self._approval_state[approval_id] = session_key
+            self._approval_state[state_id] = session_key
 
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -6301,6 +6363,173 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
+        # --- Fresh authenticated approval callbacks (fa:decision:exact-id) ---
+        if data.startswith("fa:"):
+            parts = data.split(":", 2)
+            if len(parts) != 3 or parts[1] not in {"approve_once", "deny"}:
+                await query.answer(text="Invalid approval data.")
+                return
+            decision, approval_id = parts[1], parts[2]
+
+            # Authentication is derived from Telegram's server event before
+            # any responder evidence is minted. Callback data contributes only
+            # the opaque request ID and decision.
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to approve commands.")
+                return
+
+            session_key = self._approval_state.get(approval_id)
+            if not session_key:
+                await query.answer(text="This approval has already been resolved.")
+                return
+
+            trusted_interaction = None
+            trusted_token = None
+            session_tokens = []
+            try:
+                from tools.fresh_approval import (
+                    ConversationBinding,
+                    get_fresh_approval_coordinator,
+                )
+
+                coordinator = get_fresh_approval_coordinator()
+                event_source = self.build_source(
+                    chat_id=str(query_chat_id),
+                    chat_type=(
+                        str(query_chat_type)
+                        if query_chat_type is not None
+                        else "group"
+                    ),
+                    user_id=caller_id,
+                    user_name=query_user_name,
+                    thread_id=(
+                        str(query_thread_id)
+                        if query_thread_id is not None
+                        else None
+                    ),
+                )
+                profile_id = getattr(self, "_hermes_profile_id", None)
+                if not profile_id:
+                    profile_id = event_source.profile
+                if not profile_id:
+                    runner = getattr(self, "gateway_runner", None)
+                    active_profile = getattr(runner, "_active_profile_name", None)
+                    profile_id = active_profile() if callable(active_profile) else "default"
+                runner = getattr(self, "gateway_runner", None)
+                trusted_issuer = getattr(
+                    runner,
+                    "_issue_telegram_trusted_interaction",
+                    None,
+                )
+                if callable(trusted_issuer):
+                    callback_event = MessageEvent(
+                        text="",
+                        source=event_source,
+                        message_id=str(getattr(query, "id", "")),
+                    )
+                    trusted_interaction = trusted_issuer(
+                        callback_event,
+                        session_key,
+                        surface="gateway_approval",
+                        attach=False,
+                    )
+                if trusted_interaction is not None:
+                    from agent._trusted_interaction_issuer import (
+                        _bind_trusted_interaction,
+                        _publish_trusted_interaction,
+                    )
+                    from gateway.session_context import set_session_vars
+
+                    session_tokens = set_session_vars(
+                        platform="telegram",
+                        source=trusted_interaction.surface,
+                        chat_id=trusted_interaction.chat_id,
+                        thread_id=trusted_interaction.thread_id or "",
+                        user_id=trusted_interaction.actor_id,
+                        session_key=trusted_interaction.session_key,
+                        session_id=trusted_interaction.session_id,
+                        message_id=trusted_interaction.message_id,
+                        profile=trusted_interaction.profile_id,
+                    )
+                    _publish_trusted_interaction(trusted_interaction)
+                    trusted_token = _bind_trusted_interaction(
+                        trusted_interaction
+                    )
+                responder = coordinator._mint_authenticated_responder_for_host(
+                    assurance="telegram_authenticated",
+                    principal_id=caller_id,
+                    binding=ConversationBinding(
+                        profile_id=profile_id,
+                        platform="telegram",
+                        channel_id=str(event_source.scope_id or query_chat_id),
+                        chat_id=str(query_chat_id),
+                        session_key=session_key,
+                        session_id=(
+                            trusted_interaction.session_id
+                            if trusted_interaction is not None
+                            else session_key
+                        ),
+                        thread_id=(
+                            str(query_thread_id)
+                            if query_thread_id is not None
+                            else None
+                        ),
+                        actor_id=caller_id,
+                    ),
+                    inbound_id=str(getattr(query, "id", "")),
+                )
+                resolution = coordinator.resolve(
+                    approval_id,
+                    decision=decision,
+                    responder=responder,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Fresh Telegram approval rejected (id=%s): %s",
+                    approval_id,
+                    exc,
+                )
+                await query.answer(text="Approval rejected or expired.")
+                return
+            finally:
+                if trusted_token is not None:
+                    from agent._trusted_interaction_issuer import (
+                        _clear_trusted_interactions,
+                        _reset_trusted_interaction,
+                    )
+
+                    _reset_trusted_interaction(trusted_token)
+                    _clear_trusted_interactions(
+                        interaction=trusted_interaction
+                    )
+                if session_tokens:
+                    from gateway.session_context import clear_session_vars
+
+                    clear_session_vars(session_tokens)
+
+            self._approval_state.pop(approval_id, None)
+            user_display = getattr(query.from_user, "first_name", "User")
+            label = "✅ Approved once" if resolution.outcome == "approved" else "❌ Denied"
+            await query.answer(text=label)
+            try:
+                await query.edit_message_text(
+                    text=self.format_message(f"{label} by {user_display}"),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            if query_chat_id is not None:
+                self.resume_typing_for_chat(str(query_chat_id))
+            return
+
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)
@@ -6338,8 +6567,52 @@ class TelegramAdapter(BasePlatformAdapter):
                 # the command was already denied and will not run (#63501
                 # regression follow-up: 60s waits made stale taps common).
                 try:
+                    from contextlib import nullcontext
                     from tools.approval import resolve_gateway_approval
-                    count = resolve_gateway_approval(session_key, choice)
+
+                    response_scope = nullcontext()
+                    runner = getattr(self, "gateway_runner", None)
+                    response_context = getattr(
+                        type(runner),
+                        "_trusted_telegram_response_context",
+                        None,
+                    )
+                    callback_id = str(getattr(query, "id", ""))
+                    if (
+                        callable(response_context)
+                        and query_chat_id is not None
+                        and callback_id
+                    ):
+                        event_source = self.build_source(
+                            chat_id=str(query_chat_id),
+                            chat_type=(
+                                str(query_chat_type)
+                                if query_chat_type is not None
+                                else "group"
+                            ),
+                            user_id=caller_id,
+                            user_name=query_user_name,
+                            thread_id=(
+                                str(query_thread_id)
+                                if query_thread_id is not None
+                                else None
+                            ),
+                        )
+                        callback_event = MessageEvent(
+                            text="",
+                            source=event_source,
+                            message_id=callback_id,
+                        )
+                        response_scope = response_context(
+                            runner,
+                            callback_event,
+                            session_key,
+                        )
+                    with response_scope:
+                        count = resolve_gateway_approval(
+                            session_key,
+                            choice,
+                        )
                     logger.info(
                         "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                         count, session_key, choice, user_display,
@@ -7771,7 +8044,7 @@ class TelegramAdapter(BasePlatformAdapter):
     def _telegram_free_response_chats(self) -> set[str]:
         raw = self.config.extra.get("free_response_chats")
         if raw is None:
-            raw = os.getenv("TELEGRAM_FREE_RESPONSE_CHATS", "")
+            raw = _scoped_gate_env("TELEGRAM_FREE_RESPONSE_CHATS")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
@@ -7785,7 +8058,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         raw = self.config.extra.get("free_response_topics")
         if raw is None:
-            raw = os.getenv("TELEGRAM_FREE_RESPONSE_TOPICS", "")
+            raw = _scoped_gate_env("TELEGRAM_FREE_RESPONSE_TOPICS")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
@@ -7812,7 +8085,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         raw = self.config.extra.get("allowed_chats")
         if raw is None:
-            raw = os.getenv("TELEGRAM_ALLOWED_CHATS", "")
+            raw = _scoped_gate_env("TELEGRAM_ALLOWED_CHATS")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
@@ -7821,7 +8094,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Return Telegram chats authorized at group scope."""
         raw = self.config.extra.get("group_allowed_chats")
         if raw is None:
-            raw = os.getenv("TELEGRAM_GROUP_ALLOWED_CHATS", "")
+            raw = _scoped_gate_env("TELEGRAM_GROUP_ALLOWED_CHATS")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
@@ -7851,7 +8124,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         raw = self.config.extra.get("allowed_topics")
         if raw is None:
-            raw = os.getenv("TELEGRAM_ALLOWED_TOPICS", "")
+            raw = _scoped_gate_env("TELEGRAM_ALLOWED_TOPICS")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
@@ -7859,7 +8132,7 @@ class TelegramAdapter(BasePlatformAdapter):
     def _telegram_ignored_threads(self) -> set[int]:
         raw = self.config.extra.get("ignored_threads")
         if raw is None:
-            raw = os.getenv("TELEGRAM_IGNORED_THREADS", "")
+            raw = _scoped_gate_env("TELEGRAM_IGNORED_THREADS")
 
         if isinstance(raw, list):
             values = raw
@@ -9915,7 +10188,13 @@ async def _standalone_send(
     parse-mode fallback). Implements the standalone_sender_fn contract so
     deliver=telegram cron jobs succeed when cron runs separately from the
     gateway."""
-    token = getattr(pconfig, "token", None) or os.getenv("TELEGRAM_BOT_TOKEN", "")
+    token = getattr(pconfig, "token", None)
+    if not token:
+        # Profile-scoped read: honor the secret scope's verdict rather than
+        # borrowing another profile's env-bridged token under multiplex.
+        from agent.secret_scope import get_secret
+
+        token = get_secret("TELEGRAM_BOT_TOKEN", "") or ""
     disable_link_previews = bool(
         getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews")
     )
@@ -9955,6 +10234,18 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
     import json as _json
     extras: dict = {}
 
+    # Under multiplex, a secondary profile's config loads inside its runtime
+    # scope; its authorization gate values must NOT be written to the
+    # process-global env, where first-writer-wins would pin them for every
+    # other profile (issue #72348 Telegram mirror). They are seeded into
+    # PlatformConfig.extra / read via the profile secret scope instead.
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+        _skip_env_bridge = bool(is_multiplex_active() and current_secret_scope() is not None)
+    except Exception:
+        _skip_env_bridge = False
+
     if "disable_topic_auto_rename" in telegram_cfg:
         extras.setdefault("disable_topic_auto_rename", telegram_cfg["disable_topic_auto_rename"])
 
@@ -9972,30 +10263,41 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
     if "observe_unmentioned_group_messages" in telegram_cfg and not os.getenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES"):
         os.environ["TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES"] = str(telegram_cfg["observe_unmentioned_group_messages"]).lower()
     frc = telegram_cfg.get("free_response_chats")
-    if frc is not None and not os.getenv("TELEGRAM_FREE_RESPONSE_CHATS"):
+    if frc is not None:
+        extras.setdefault("free_response_chats", frc)
         if isinstance(frc, list):
             frc = ",".join(str(v) for v in frc)
-        os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] = str(frc)
+        if not _skip_env_bridge and not os.getenv("TELEGRAM_FREE_RESPONSE_CHATS"):
+            os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] = str(frc)
     frt = telegram_cfg.get("free_response_topics")
-    if frt is not None and not os.getenv("TELEGRAM_FREE_RESPONSE_TOPICS"):
+    if frt is not None:
         if isinstance(frt, list):
             frt = ",".join(str(v) for v in frt)
-        os.environ["TELEGRAM_FREE_RESPONSE_TOPICS"] = str(frt)
+        if not _skip_env_bridge and not os.getenv("TELEGRAM_FREE_RESPONSE_TOPICS"):
+            os.environ["TELEGRAM_FREE_RESPONSE_TOPICS"] = str(frt)
     ac = telegram_cfg.get("allowed_chats")
-    if ac is not None and not os.getenv("TELEGRAM_ALLOWED_CHATS"):
+    if ac is not None:
         if isinstance(ac, list):
             ac = ",".join(str(v) for v in ac)
-        os.environ["TELEGRAM_ALLOWED_CHATS"] = str(ac)
+        # NOTE: no extras seed here — gateway/config.py's shared-key loop
+        # already bridges ``allowed_chats`` into PlatformConfig.extra with its
+        # original type, and the apply_yaml_config merge would clobber it.
+        if not _skip_env_bridge and not os.getenv("TELEGRAM_ALLOWED_CHATS"):
+            os.environ["TELEGRAM_ALLOWED_CHATS"] = str(ac)
     allowed_topics = telegram_cfg.get("allowed_topics")
-    if allowed_topics is not None and not os.getenv("TELEGRAM_ALLOWED_TOPICS"):
+    if allowed_topics is not None:
         if isinstance(allowed_topics, list):
             allowed_topics = ",".join(str(v) for v in allowed_topics)
-        os.environ["TELEGRAM_ALLOWED_TOPICS"] = str(allowed_topics)
+        # extras seed intentionally omitted (shared-key loop bridges allowed_topics).
+        if not _skip_env_bridge and not os.getenv("TELEGRAM_ALLOWED_TOPICS"):
+            os.environ["TELEGRAM_ALLOWED_TOPICS"] = str(allowed_topics)
     ignored_threads = telegram_cfg.get("ignored_threads")
-    if ignored_threads is not None and not os.getenv("TELEGRAM_IGNORED_THREADS"):
+    if ignored_threads is not None:
+        extras.setdefault("ignored_threads", ignored_threads)
         if isinstance(ignored_threads, list):
             ignored_threads = ",".join(str(v) for v in ignored_threads)
-        os.environ["TELEGRAM_IGNORED_THREADS"] = str(ignored_threads)
+        if not _skip_env_bridge and not os.getenv("TELEGRAM_IGNORED_THREADS"):
+            os.environ["TELEGRAM_IGNORED_THREADS"] = str(ignored_threads)
     if "reactions" in telegram_cfg and not os.getenv("TELEGRAM_REACTIONS"):
         os.environ["TELEGRAM_REACTIONS"] = str(telegram_cfg["reactions"]).lower()
     if "proxy_url" in telegram_cfg and not os.getenv("TELEGRAM_PROXY"):
@@ -10009,20 +10311,24 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
         _rtm_str = "off" if _telegram_rtm is False else str(_telegram_rtm).lower()
         os.environ["TELEGRAM_REPLY_TO_MODE"] = _rtm_str
     allowed_users = telegram_cfg.get("allow_from")
-    if allowed_users is not None and not os.getenv("TELEGRAM_ALLOWED_USERS"):
+    if allowed_users is not None:
         if isinstance(allowed_users, list):
             allowed_users = ",".join(str(v) for v in allowed_users)
-        os.environ["TELEGRAM_ALLOWED_USERS"] = str(allowed_users)
+        if not _skip_env_bridge and not os.getenv("TELEGRAM_ALLOWED_USERS"):
+            os.environ["TELEGRAM_ALLOWED_USERS"] = str(allowed_users)
     group_allowed_users = telegram_cfg.get("group_allow_from") or _telegram_extra.get("group_allow_from")
-    if group_allowed_users is not None and not os.getenv("TELEGRAM_GROUP_ALLOWED_USERS"):
+    if group_allowed_users is not None:
         if isinstance(group_allowed_users, list):
             group_allowed_users = ",".join(str(v) for v in group_allowed_users)
-        os.environ["TELEGRAM_GROUP_ALLOWED_USERS"] = str(group_allowed_users)
+        if not _skip_env_bridge and not os.getenv("TELEGRAM_GROUP_ALLOWED_USERS"):
+            os.environ["TELEGRAM_GROUP_ALLOWED_USERS"] = str(group_allowed_users)
     group_allowed_chats = telegram_cfg.get("group_allowed_chats") or _telegram_extra.get("group_allowed_chats")
-    if group_allowed_chats is not None and not os.getenv("TELEGRAM_GROUP_ALLOWED_CHATS"):
+    if group_allowed_chats is not None:
         if isinstance(group_allowed_chats, list):
             group_allowed_chats = ",".join(str(v) for v in group_allowed_chats)
-        os.environ["TELEGRAM_GROUP_ALLOWED_CHATS"] = str(group_allowed_chats)
+        # extras seed intentionally omitted (shared-key loop bridges group_allowed_chats).
+        if not _skip_env_bridge and not os.getenv("TELEGRAM_GROUP_ALLOWED_CHATS"):
+            os.environ["TELEGRAM_GROUP_ALLOWED_CHATS"] = str(group_allowed_chats)
     for _key in ("guest_mode", "disable_link_previews", "observe_unmentioned_group_messages", "free_response_topics"):
         if _key in telegram_cfg:
             extras.setdefault(_key, telegram_cfg[_key])

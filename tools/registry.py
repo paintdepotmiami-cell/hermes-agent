@@ -24,6 +24,8 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
+from registry_transaction import RegistryTransactionConflict
+
 logger = logging.getLogger(__name__)
 
 
@@ -189,6 +191,71 @@ class ToolEntry:
         self.dynamic_schema_overrides = dynamic_schema_overrides
 
 
+class _ToolRegistrySnapshot:
+    """Opaque, host-private checkpoint for one :class:`ToolRegistry`.
+
+    State is stored as immutable tuples so callers cannot obtain a mutable
+    dictionary and edit the live registry through a transaction token.
+    """
+
+    __slots__ = (
+        "_owner",
+        "_tools",
+        "_toolset_checks",
+        "_toolset_aliases",
+        "_plugin_override_policy",
+        "_generation",
+    )
+
+    def __init__(
+        self,
+        owner: "ToolRegistry",
+        tools: tuple,
+        toolset_checks: tuple,
+        toolset_aliases: tuple,
+        plugin_override_policy: tuple,
+        generation: int,
+    ) -> None:
+        self._owner = owner
+        self._tools = tools
+        self._toolset_checks = toolset_checks
+        self._toolset_aliases = toolset_aliases
+        self._plugin_override_policy = plugin_override_policy
+        self._generation = generation
+
+
+class _PreparedToolRegistryState:
+    """Host-private, registry-bound state ready for a live atomic install."""
+
+    __slots__ = (
+        "_owner",
+        "_snapshot",
+        "_tools",
+        "_toolset_checks",
+        "_toolset_aliases",
+        "_plugin_override_policy",
+        "_generation",
+    )
+
+    def __init__(
+        self,
+        owner: "ToolRegistry",
+        snapshot: _ToolRegistrySnapshot,
+        tools: Dict[str, ToolEntry],
+        toolset_checks: Dict[str, Callable],
+        toolset_aliases: Dict[str, str],
+        plugin_override_policy: Dict[str, bool],
+        generation: int,
+    ) -> None:
+        self._owner = owner
+        self._snapshot = snapshot
+        self._tools = tools
+        self._toolset_checks = toolset_checks
+        self._toolset_aliases = toolset_aliases
+        self._plugin_override_policy = plugin_override_policy
+        self._generation = generation
+
+
 # ---------------------------------------------------------------------------
 # check_fn TTL cache
 #
@@ -218,10 +285,54 @@ _CHECK_FN_TTL_SECONDS = 30.0
 # as a flake (last-good True is served) rather than a real outage. Kept short
 # so a genuinely-down backend is reflected within a couple of turns.
 _CHECK_FN_FAILURE_GRACE_SECONDS = 60.0
-_check_fn_cache: Dict[Callable, tuple[float, bool]] = {}
+_CHECK_FN_CACHE_MAX = 512
+_check_fn_cache: Dict[tuple[Callable, Optional[str]], tuple[float, bool]] = {}
 # Monotonic timestamp of the most recent True result per check_fn.
-_check_fn_last_good: Dict[Callable, float] = {}
+_check_fn_last_good: Dict[tuple[Callable, Optional[str]], float] = {}
 _check_fn_cache_lock = threading.Lock()
+CHECK_FN_CACHE_BYPASS = ""
+
+
+def _prune_check_fn_caches(now: float) -> None:
+    """Expire stale entries and cap profile-dimensional cache growth.
+
+    Caller must hold ``_check_fn_cache_lock``.
+    """
+    for key, (timestamp, _) in list(_check_fn_cache.items()):
+        if now - timestamp >= _CHECK_FN_TTL_SECONDS:
+            _check_fn_cache.pop(key, None)
+    for key, timestamp in list(_check_fn_last_good.items()):
+        if now - timestamp >= _CHECK_FN_FAILURE_GRACE_SECONDS:
+            _check_fn_last_good.pop(key, None)
+    while len(_check_fn_cache) >= _CHECK_FN_CACHE_MAX:
+        _check_fn_cache.pop(next(iter(_check_fn_cache)))
+    while len(_check_fn_last_good) >= _CHECK_FN_CACHE_MAX:
+        _check_fn_last_good.pop(next(iter(_check_fn_last_good)))
+
+
+def check_fn_cache_scope() -> Optional[str]:
+    """Return the active profile key when availability is profile-scoped.
+
+    Single-profile processes intentionally keep the historical process-wide
+    cache. A multiplex gateway installs a Hermes-home override for every
+    profile turn, so the canonical profile key is the stable isolation
+    boundary across repeated turns for that profile.
+    """
+    try:
+        from agent.secret_scope import is_multiplex_active
+
+        if not is_multiplex_active():
+            return None
+        from hermes_constants import get_hermes_home_override
+
+        override = get_hermes_home_override()
+        if not override:
+            return CHECK_FN_CACHE_BYPASS
+        return str(Path(override).expanduser().resolve())
+    except Exception:
+        # Fail closed: bypass both cache layers rather than aliasing requests
+        # whose multiplex profile identity could not be resolved.
+        return CHECK_FN_CACHE_BYPASS
 
 
 def _check_fn_cached(fn: Callable) -> bool:
@@ -234,8 +345,22 @@ def _check_fn_cached(fn: Callable) -> bool:
     contention, probe timeout) from silently stripping tools mid-session.
     """
     now = time.monotonic()
+    scope = check_fn_cache_scope()
+    if scope == CHECK_FN_CACHE_BYPASS:
+        try:
+            return bool(fn())
+        except Exception:
+            logger.warning(
+                "check_fn %s raised while profile cache scope was unresolved; "
+                "dependent tools will be unavailable this turn",
+                getattr(fn, "__qualname__", fn),
+                exc_info=True,
+            )
+            return False
+    cache_key = (fn, scope)
     with _check_fn_cache_lock:
-        cached = _check_fn_cache.get(fn)
+        _prune_check_fn_caches(now)
+        cached = _check_fn_cache.get(cache_key)
         if cached is not None:
             ts, value = cached
             if now - ts < _CHECK_FN_TTL_SECONDS:
@@ -249,12 +374,13 @@ def _check_fn_cached(fn: Callable) -> bool:
         raised = True
 
     with _check_fn_cache_lock:
+        _prune_check_fn_caches(now)
         if value:
-            _check_fn_last_good[fn] = now
-            _check_fn_cache[fn] = (now, True)
+            _check_fn_last_good[cache_key] = now
+            _check_fn_cache[cache_key] = (now, True)
             return True
 
-        last_good = _check_fn_last_good.get(fn)
+        last_good = _check_fn_last_good.get(cache_key)
         if last_good is not None and now - last_good < _CHECK_FN_FAILURE_GRACE_SECONDS:
             # Recent success → treat this failure as a flake. Serve last-good
             # True and do NOT cache the failure, so the next call re-probes
@@ -275,7 +401,7 @@ def _check_fn_cached(fn: Callable) -> bool:
             getattr(fn, "__qualname__", fn),
             "raised" if raised else "returned False",
         )
-        _check_fn_cache[fn] = (now, False)
+        _check_fn_cache[cache_key] = (now, False)
         return False
 
 
@@ -287,6 +413,30 @@ def invalidate_check_fn_cache() -> None:
         _check_fn_last_good.clear()
 
 
+def get_cached_check_fn_result(fn: Callable) -> Optional[bool]:
+    """Return the current cached verdict for *fn* if its TTL is still valid.
+
+    Unlike :func:`_check_fn_cached`, this NEVER executes the probe. It is for
+    read-only surfaces (e.g. dashboard status panels) that need the last-known
+    availability without triggering network / auth / SDK work inside a request
+    path. Returns ``None`` when there is no fresh cached verdict.
+    """
+    now = time.monotonic()
+    scope = check_fn_cache_scope()
+    if scope == CHECK_FN_CACHE_BYPASS:
+        # Unresolved profile identity bypasses the cache entirely; there is no
+        # trustworthy cached verdict to report.
+        return None
+    with _check_fn_cache_lock:
+        cached = _check_fn_cache.get((fn, scope))
+        if cached is None:
+            return None
+        ts, value = cached
+        if now - ts < _CHECK_FN_TTL_SECONDS:
+            return value
+        return None
+
+
 class ToolRegistry:
     """Singleton registry that collects tool schemas + handlers from tool files."""
 
@@ -294,9 +444,9 @@ class ToolRegistry:
         self._tools: Dict[str, ToolEntry] = {}
         # Durable map: plugin module namespace (handler.__globals__["__name__"])
         # -> operator opt-in for built-in override. Populated at plugin load and
-        # never cleared, so a plugin's override authorization is bound to the
-        # code that defined the handler, independent of WHEN the register() call
-        # happens (sync during load, or a delayed/threaded callback afterwards).
+        # durable once that load commits (failed load transactions restore the
+        # checkpoint), so authorization is bound to the code that defined the
+        # handler independent of WHEN registration happens.
         self._plugin_override_policy: Dict[str, bool] = {}
         self._toolset_checks: Dict[str, Callable] = {}
         self._toolset_aliases: Dict[str, str] = {}
@@ -310,6 +460,198 @@ class ToolRegistry:
         # against it: a cache entry keyed on the generation is valid for as
         # long as the generation hasn't changed.
         self._generation: int = 0
+        # Set only on isolated transaction registries. The opaque source
+        # snapshot binds a staging view to one live registry and one baseline.
+        self._transaction_owner: Optional["ToolRegistry"] = None
+        self._transaction_snapshot: Optional[_ToolRegistrySnapshot] = None
+        self._transaction_frozen = False
+
+    def _take_transaction_snapshot(self) -> _ToolRegistrySnapshot:
+        """Return an opaque host-private checkpoint under the registry lock."""
+        with self._lock:
+            return _ToolRegistrySnapshot(
+                owner=self,
+                tools=tuple(self._tools.items()),
+                toolset_checks=tuple(self._toolset_checks.items()),
+                toolset_aliases=tuple(self._toolset_aliases.items()),
+                plugin_override_policy=tuple(self._plugin_override_policy.items()),
+                generation=self._generation,
+            )
+
+    def _validate_transaction_snapshot(
+        self,
+        snapshot: _ToolRegistrySnapshot,
+    ) -> None:
+        if (
+            not isinstance(snapshot, _ToolRegistrySnapshot)
+            or snapshot._owner is not self
+        ):
+            raise ValueError("transaction snapshot belongs to a different ToolRegistry")
+
+    def _create_transaction_view(
+        self,
+        snapshot: _ToolRegistrySnapshot,
+        *,
+        remove_names: Set[str] | None = None,
+        remove_policy_names: Set[str] | None = None,
+    ) -> "ToolRegistry":
+        """Create an isolated registry seeded only from an opaque checkpoint."""
+        self._validate_transaction_snapshot(snapshot)
+        removed = remove_names or set()
+        staged = ToolRegistry()
+        staged._tools = {
+            name: entry for name, entry in snapshot._tools if name not in removed
+        }
+        remaining_toolsets = {entry.toolset for entry in staged._tools.values()}
+        staged._toolset_checks = {
+            name: check
+            for name, check in snapshot._toolset_checks
+            if name in remaining_toolsets
+        }
+        staged._toolset_aliases = {
+            alias: target
+            for alias, target in snapshot._toolset_aliases
+            if target in remaining_toolsets
+        }
+        removed_policies = remove_policy_names or set()
+        staged._plugin_override_policy = {
+            name: allowed
+            for name, allowed in snapshot._plugin_override_policy
+            if name not in removed_policies
+        }
+        staged._generation = snapshot._generation
+        staged._transaction_owner = self
+        staged._transaction_snapshot = snapshot
+        return staged
+
+    def _prepare_transaction_commit(
+        self,
+        snapshot: _ToolRegistrySnapshot,
+        staged: "ToolRegistry",
+    ) -> _PreparedToolRegistryState:
+        """Freeze one staging view without touching or locking live state."""
+        self._validate_transaction_snapshot(snapshot)
+        if (
+            not isinstance(staged, ToolRegistry)
+            or staged._transaction_owner is not self
+            or staged._transaction_snapshot is not snapshot
+        ):
+            raise ValueError("transaction view belongs to a different ToolRegistry")
+        with staged._lock:
+            prepared = _PreparedToolRegistryState(
+                owner=self,
+                snapshot=snapshot,
+                tools=dict(staged._tools),
+                toolset_checks=dict(staged._toolset_checks),
+                toolset_aliases=dict(staged._toolset_aliases),
+                plugin_override_policy=dict(staged._plugin_override_policy),
+                generation=staged._generation,
+            )
+            staged._transaction_frozen = True
+            return prepared
+
+    def _matches_transaction_snapshot_locked(
+        self,
+        snapshot: _ToolRegistrySnapshot,
+    ) -> bool:
+        """Return whether live state is still the exact captured baseline."""
+        return (
+            self._generation == snapshot._generation
+            and len(self._tools) == len(snapshot._tools)
+            and all(
+                name in self._tools and self._tools[name] is entry
+                for name, entry in snapshot._tools
+            )
+            and len(self._toolset_checks) == len(snapshot._toolset_checks)
+            and all(
+                name in self._toolset_checks
+                and self._toolset_checks[name] is check
+                for name, check in snapshot._toolset_checks
+            )
+            and tuple(self._toolset_aliases.items()) == snapshot._toolset_aliases
+            and tuple(self._plugin_override_policy.items())
+            == snapshot._plugin_override_policy
+        )
+
+    def _validate_prepared_transaction_locked(
+        self,
+        snapshot: _ToolRegistrySnapshot,
+        prepared: _PreparedToolRegistryState,
+    ) -> None:
+        self._validate_transaction_snapshot(snapshot)
+        if (
+            not isinstance(prepared, _PreparedToolRegistryState)
+            or prepared._owner is not self
+            or prepared._snapshot is not snapshot
+        ):
+            raise ValueError("transaction view belongs to a different ToolRegistry")
+        if not self._matches_transaction_snapshot_locked(snapshot):
+            raise RegistryTransactionConflict(
+                "tool",
+                snapshot._generation,
+                self._generation,
+            )
+
+    def _install_prepared_transaction_locked(
+        self,
+        snapshot: _ToolRegistrySnapshot,
+        prepared: _PreparedToolRegistryState,
+    ) -> None:
+        """Validate and install prepared state while ``self._lock`` is held."""
+        self._validate_prepared_transaction_locked(snapshot, prepared)
+        self._tools = prepared._tools
+        self._toolset_checks = prepared._toolset_checks
+        self._toolset_aliases = prepared._toolset_aliases
+        self._plugin_override_policy = prepared._plugin_override_policy
+        self._generation = max(self._generation, prepared._generation) + 1
+        invalidate_check_fn_cache()
+
+    def _commit_transaction_view(
+        self,
+        snapshot: _ToolRegistrySnapshot,
+        staged: "ToolRegistry",
+    ) -> None:
+        """Conflict-check and atomically install an isolated staging view."""
+        prepared = self._prepare_transaction_commit(snapshot, staged)
+        with self._lock:
+            self._install_prepared_transaction_locked(snapshot, prepared)
+
+    def _restore_transaction_snapshot_locked(
+        self,
+        snapshot: _ToolRegistrySnapshot,
+    ) -> None:
+        """Restore a valid checkpoint while ``self._lock`` is held."""
+        self._validate_transaction_snapshot(snapshot)
+        self._tools = dict(snapshot._tools)
+        self._toolset_checks = dict(snapshot._toolset_checks)
+        self._toolset_aliases = dict(snapshot._toolset_aliases)
+        self._plugin_override_policy = dict(snapshot._plugin_override_policy)
+        self._generation = max(self._generation, snapshot._generation) + 1
+        invalidate_check_fn_cache()
+
+    def _restore_transaction_snapshot_exact_locked(
+        self,
+        snapshot: _ToolRegistrySnapshot,
+    ) -> None:
+        """Restore a transaction checkpoint exactly while ``self._lock`` is held."""
+        self._validate_transaction_snapshot(snapshot)
+        self._tools = dict(snapshot._tools)
+        self._toolset_checks = dict(snapshot._toolset_checks)
+        self._toolset_aliases = dict(snapshot._toolset_aliases)
+        self._plugin_override_policy = dict(snapshot._plugin_override_policy)
+        self._generation = snapshot._generation
+        invalidate_check_fn_cache()
+
+    def _restore_transaction_snapshot(self, snapshot: _ToolRegistrySnapshot) -> None:
+        """Restore a host checkpoint and invalidate every derived cache.
+
+        The generation never moves backwards: restoration is itself a new
+        mutation, so memoizers observing any state from the failed attempt are
+        forced to refresh.
+        """
+        self._validate_transaction_snapshot(snapshot)
+        with self._lock:
+            self._restore_transaction_snapshot_locked(snapshot)
 
     def _snapshot_state(self) -> tuple[List[ToolEntry], Dict[str, Callable]]:
         """Return a coherent snapshot of registry entries and toolset checks."""
@@ -388,12 +730,16 @@ class ToolRegistry:
 
     def register_plugin_override_policy(self, module_namespace: str, allowed: bool) -> None:
         """Bind a plugin module namespace to its operator opt-in for built-in
-        override. Called once per plugin at load time. Durable: never cleared,
-        so later (even threaded/delayed) register() calls from that module are
-        still gated by the same policy.
+        override. Called once per plugin at load time. Durable after a
+        successful load, so later (even threaded/delayed) register() calls
+        from that module are still gated by the same policy. Failed plugin
+        transactions restore the previous policy checkpoint.
         """
         with self._lock:
+            if self._transaction_frozen:
+                raise RuntimeError("tool transaction view is frozen")
             self._plugin_override_policy[module_namespace] = bool(allowed)
+            self._generation += 1
 
     def _plugin_owner_of(self, handler: Callable) -> Optional[str]:
         """Return the plugin module namespace that defined *handler*, or None
@@ -458,11 +804,16 @@ class ToolRegistry:
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
         """
+        prepared_owner = self._plugin_owner_of(handler)
+        prepared_requires_env = requires_env or []
+        prepared_description = description or schema.get("description", "")
         with self._lock:
+            if self._transaction_frozen:
+                raise RuntimeError("tool transaction view is frozen")
             existing = self._tools.get(name)
             if existing and existing.toolset != toolset:
                 if override:
-                    _owner = self._plugin_owner_of(handler)
+                    _owner = prepared_owner
                     if _owner is not None and not self._plugin_override_policy.get(_owner, False):
                         logger.error(
                             "Tool registration REJECTED: plugin %r attempted to "
@@ -502,9 +853,9 @@ class ToolRegistry:
                 schema=schema,
                 handler=handler,
                 check_fn=check_fn,
-                requires_env=requires_env or [],
+                requires_env=prepared_requires_env,
                 is_async=is_async,
-                description=description or schema.get("description", ""),
+                description=prepared_description,
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
@@ -536,6 +887,8 @@ class ToolRegistry:
         every refresh and has no plugin-override concept.
         """
         with self._lock:
+            if self._transaction_frozen:
+                raise RuntimeError("tool transaction view is frozen")
             entry = self._tools.get(name)
             if entry is None:
                 return

@@ -29,16 +29,21 @@ import threading
 from typing import Dict, List, Optional
 
 from agent.video_gen_provider import VideoGenProvider
+from registry_transaction import MappingRegistry, RegistryTransactionSurface
 
 logger = logging.getLogger(__name__)
 
 
 _providers: Dict[str, VideoGenProvider] = {}
-_lock = threading.Lock()
+_lock = threading.RLock()
+_registry_state = MappingRegistry("video_gen", _providers, _lock)
 
 
-def register_provider(provider: VideoGenProvider) -> None:
-    """Register a video generation provider.
+def _register_provider_in(
+    target: MappingRegistry,
+    provider: VideoGenProvider,
+) -> str:
+    """Validate and register into a live registry or isolated transaction view.
 
     Re-registration (same ``name``) overwrites the previous entry and logs
     a debug message — this makes hot-reload scenarios (tests, dev loops)
@@ -52,19 +57,28 @@ def register_provider(provider: VideoGenProvider) -> None:
     name = provider.name
     if not isinstance(name, str) or not name.strip():
         raise ValueError("Video gen provider .name must be a non-empty string")
-    with _lock:
-        existing = _providers.get(name)
-        _providers[name] = provider
+    _added, existing = target.put(name, provider)
     if existing is not None:
         logger.debug("Video gen provider '%s' re-registered (was %r)", name, type(existing).__name__)
     else:
         logger.debug("Registered video gen provider '%s' (%s)", name, type(provider).__name__)
+    return name
+
+
+def register_provider(provider: VideoGenProvider) -> None:
+    """Register a video generation provider."""
+    _register_provider_in(_registry_state, provider)
+
+
+_plugin_transaction = RegistryTransactionSurface(
+    _registry_state,
+    _register_provider_in,
+)
 
 
 def list_providers() -> List[VideoGenProvider]:
     """Return all registered providers, sorted by name."""
-    with _lock:
-        items = list(_providers.values())
+    items = _registry_state.values()
     return sorted(items, key=lambda p: p.name)
 
 
@@ -72,8 +86,7 @@ def get_provider(name: str) -> Optional[VideoGenProvider]:
     """Return the provider registered under *name*, or None."""
     if not isinstance(name, str):
         return None
-    with _lock:
-        return _providers.get(name.strip())
+    return _registry_state.get(name.strip())
 
 
 def get_active_provider() -> Optional[VideoGenProvider]:
@@ -95,8 +108,7 @@ def get_active_provider() -> Optional[VideoGenProvider]:
     except Exception as exc:
         logger.debug("Could not read video_gen.provider from config: %s", exc)
 
-    with _lock:
-        snapshot = dict(_providers)
+    snapshot = dict(_registry_state.items_snapshot())
 
     if configured:
         provider = snapshot.get(configured)
@@ -129,5 +141,4 @@ def get_active_provider() -> Optional[VideoGenProvider]:
 
 def _reset_for_tests() -> None:
     """Clear the registry. **Test-only.**"""
-    with _lock:
-        _providers.clear()
+    _registry_state.clear()

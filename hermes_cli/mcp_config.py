@@ -747,7 +747,11 @@ def cmd_mcp_test(args):
     auth_type = cfg.get("auth", "")
     headers = cfg.get("headers", {})
     if auth_type == "oauth":
-        _info("Auth: OAuth 2.1 PKCE")
+        oauth_config = cfg.get("oauth") or {}
+        if oauth_config.get("grant_type") == "client_credentials":
+            _info("Auth: OAuth 2.0 client credentials (M2M)")
+        else:
+            _info("Auth: OAuth 2.1 PKCE")
     elif headers:
         for k, v in headers.items():
             if isinstance(v, str) and ("key" in k.lower() or "auth" in k.lower()):
@@ -800,6 +804,24 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
         _error(f"Server '{name}' is not configured for OAuth (auth={server_config.get('auth')})")
         _info("Use `hermes mcp remove` + `hermes mcp add` to reconfigure auth.")
         return False
+
+    oauth_config = server_config.get("oauth") or {}
+    if oauth_config.get("grant_type") == "client_credentials":
+        try:
+            from tools.mcp_oauth_manager import get_manager
+
+            get_manager().evict(name)
+            print()
+            _info(f"Validating M2M credentials for '{name}'...")
+            tools = _probe_single_server(name, server_config)
+            if tools:
+                _success(f"M2M authenticated — {len(tools)} tool(s) available")
+            else:
+                _success("M2M authenticated (server reported no tools)")
+            return True
+        except Exception as exc:
+            _error(f"M2M authentication failed: {exc}")
+            return False
 
     # Wipe both disk and in-memory cache so the next probe forces a fresh
     # OAuth flow.

@@ -541,7 +541,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
 from enum import Enum
 
 from pathlib import Path as _Path
@@ -550,6 +550,9 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 from gateway.config import Platform, PlatformConfig
 from gateway.session import SessionSource, build_session_key
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
+
+if TYPE_CHECKING:
+    from agent.display import ToolPreview
 
 
 # ---------------------------------------------------------------------------
@@ -3095,11 +3098,27 @@ class BasePlatformAdapter(ABC):
         # progress bubbles compact — they persist as permanent messages).
         preview = event.preview
         if preview:
+            from agent.display import prepare_tool_preview
+
             cap = preview_max_len if preview_max_len > 0 else 40
-            if len(preview) > cap:
-                preview = preview[:cap - 3] + "..."
-            return f"{emoji} {event.tool_name}: \"{preview}\""
+            prepared = prepare_tool_preview(
+                event.tool_name,
+                event.args,
+                fallback=preview,
+                max_len=cap,
+            )
+            rendered = self.format_tool_preview(prepared)
+            return f"{emoji} {event.tool_name}: \"{rendered}\""
         return f"{emoji} {event.tool_name}..."
+
+    def format_tool_preview(self, preview: "ToolPreview") -> str:
+        """Apply platform-native formatting to a compact tool preview.
+
+        Most adapters only need the compact text. Rich-text adapters can use
+        the preview's explicit metadata to preserve details such as a URL that
+        was shortened for display.
+        """
+        return preview.text
 
     @property
     def has_fatal_error(self) -> bool:
@@ -3674,16 +3693,25 @@ class BasePlatformAdapter(ABC):
         command: str,
         description: str = "dangerous command",
         smart_denied: bool = False,
+        *,
+        truncate_command: bool = True,
     ) -> str:
         """Shared formatting core for exec-approval prompt text.
 
-        Assembles ``_EA_HEADER`` + fenced command preview (truncated to
-        ``_EA_CMD_BUDGET``) + ``_EA_REASON_LABEL`` + description, plus
-        ``_EA_SMART_DENY_LINE`` when ``smart_denied``. Button construction
-        stays platform-local; adapters with additional trailing instructions
-        (e.g. reaction legends) append them to this core.
+        Assembles ``_EA_HEADER`` + fenced command preview +
+        ``_EA_REASON_LABEL`` + description, plus ``_EA_SMART_DENY_LINE`` when
+        ``smart_denied``. Legacy callers use the established
+        ``_EA_CMD_BUDGET`` cap. Exact fresh approvals can disable that cap so
+        the displayed preview remains identical to the bound preview. Button
+        construction stays platform-local; adapters with additional trailing
+        instructions (e.g. reaction legends) append them to this core.
         """
-        cmd_preview = self._truncate_preview(str(command or ""), self._EA_CMD_BUDGET)
+        command_text = str(command or "")
+        cmd_preview = (
+            self._truncate_preview(command_text, self._EA_CMD_BUDGET)
+            if truncate_command
+            else command_text
+        )
         text = (
             f"{self._EA_HEADER}"
             f"{self._EA_CODE_OPEN}{self._ea_escape(cmd_preview)}{self._EA_CODE_CLOSE}"
@@ -5545,11 +5573,16 @@ class BasePlatformAdapter(ABC):
 
         coerce_plaintext_gateway_command(event)
 
-        # Rewrite ``event.source.thread_id`` via the installed recovery hook
-        # (Telegram DM topic mode) so the session key, guard checks, and
-        # downstream delivery all agree on the same lane.
-        # Offloaded: the sync hook must not block the loop.
-        await asyncio.to_thread(self._apply_topic_recovery, event)
+        # Telegram topic recovery only applies to private DM topic lanes. Do
+        # not submit a no-op check for group/forum/channel traffic to the
+        # shared default executor: a busy pool would delay message dispatch.
+        needs_topic_recovery = (
+            getattr(self, "_topic_recovery_fn", None) is not None
+            and event.source.platform == Platform.TELEGRAM
+            and event.source.chat_type == "dm"
+        )
+        if needs_topic_recovery:
+            await asyncio.to_thread(self._apply_topic_recovery, event)
 
         session_key = build_session_key(
             event.source,
@@ -6042,13 +6075,14 @@ class BasePlatformAdapter(ABC):
                                 record_obligation,
                             )
 
-                            if ledger_enabled():
+                            if await asyncio.to_thread(ledger_enabled):
                                 _obligation_id = compute_obligation_id(
                                     session_key,
                                     str(getattr(event, "message_id", "") or ""),
                                     text_content,
                                 )
-                                record_obligation(
+                                await asyncio.to_thread(
+                                    record_obligation,
                                     obligation_id=_obligation_id,
                                     session_key=session_key,
                                     platform=str(
@@ -6059,7 +6093,7 @@ class BasePlatformAdapter(ABC):
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
                                 )
-                                mark_attempting(_obligation_id)
+                                await asyncio.to_thread(mark_attempting, _obligation_id)
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
@@ -6078,9 +6112,10 @@ class BasePlatformAdapter(ABC):
                             )
 
                             if getattr(result, "success", False):
-                                mark_delivered(_obligation_id)
+                                await asyncio.to_thread(mark_delivered, _obligation_id)
                             else:
-                                mark_failed(
+                                await asyncio.to_thread(
+                                    mark_failed,
                                     _obligation_id,
                                     str(getattr(result, "error", "") or ""),
                                 )
