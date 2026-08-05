@@ -446,15 +446,35 @@ class TestDisabledPluginDiagnostic:
 
     def test_search_tool_reports_disabled_plugin(self, monkeypatch):
         from tools import web_tools
+        from agent.web_search_provider import WebSearchProvider
 
         restore = self._clear_registry()
         try:
+            class StaleFirecrawl(WebSearchProvider):
+                @property
+                def name(self):
+                    return "firecrawl"
+
+                @property
+                def display_name(self):
+                    return "Stale Firecrawl"
+
+                def is_available(self):
+                    return True
+
+                def supports_search(self):
+                    return True
+
+                def search(self, query, limit=5):
+                    return {"success": True, "data": {"web": []}}
+
+            import agent.web_search_registry as wsr
+            wsr.register_provider(StaleFirecrawl())
             monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
             monkeypatch.setattr(
                 web_tools, "_load_web_config",
                 lambda: {"search_backend": "firecrawl"},
             )
-            import agent.web_search_registry as wsr
             monkeypatch.setattr(
                 wsr, "_read_config_key",
                 lambda *path: "firecrawl" if path == ("web", "search_backend") else None,
@@ -467,6 +487,56 @@ class TestDisabledPluginDiagnostic:
             assert "disabled" in err
             assert "web/firecrawl" in err
             assert "No web search provider configured" not in err
+        finally:
+            restore()
+
+    def test_extract_tool_reports_disabled_plugin_with_stale_provider(self, monkeypatch):
+        import asyncio
+        from agent.web_search_provider import WebSearchProvider
+        from tools import web_tools
+
+        restore = self._clear_registry()
+        try:
+            class StaleFirecrawl(WebSearchProvider):
+                @property
+                def name(self):
+                    return "firecrawl"
+
+                @property
+                def display_name(self):
+                    return "Stale Firecrawl"
+
+                def is_available(self):
+                    return True
+
+                def supports_extract(self):
+                    return True
+
+                async def extract(self, urls, format=None):
+                    return []
+
+            import agent.web_search_registry as wsr
+            wsr.register_provider(StaleFirecrawl())
+            monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+            monkeypatch.setattr(
+                web_tools,
+                "_load_web_config",
+                lambda: {"extract_backend": "firecrawl"},
+            )
+            monkeypatch.setattr(
+                wsr,
+                "_read_config_key",
+                lambda *path: "firecrawl" if path == ("web", "extract_backend") else None,
+            )
+            self._patch_manager(monkeypatch, {
+                "web/firecrawl": self._FakeLoaded(False, "disabled via config"),
+            })
+            result = json.loads(asyncio.run(
+                web_tools.web_extract_tool(["https://example.com"])
+            ))
+            err = result["error"]
+            assert "disabled" in err
+            assert "web/firecrawl" in err
         finally:
             restore()
 

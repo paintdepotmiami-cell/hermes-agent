@@ -682,38 +682,38 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             _disabled_web_plugin_for,
         )
 
+        disabled_key = _disabled_web_plugin_for(capability="search")
         backend = _get_search_backend()
-        provider = _wsp_get_provider(backend) if backend else None
-        if provider is None or not provider.supports_search():
+        provider = (
+            None
+            if disabled_key
+            else (_wsp_get_provider(backend) if backend else None)
+        )
+        if not disabled_key and (provider is None or not provider.supports_search()):
             # Fall back to availability-walked active provider when the
             # configured backend isn't a registered search provider (typo,
             # uninstalled plugin, or capability mismatch).
             provider = get_active_search_provider()
 
-        if provider is None:
-            # A bundled web plugin the user explicitly disabled looks
-            # identical to "no provider" here — point at the real cause
-            # (re-enable the plugin) rather than a generic setup hint.
-            disabled_key = _disabled_web_plugin_for(capability="search")
-            if disabled_key:
-                _vendor = disabled_key.split("/", 1)[-1]
-                response_data = {
-                    "success": False,
-                    "error": (
-                        f"web.search_backend is set to '{_vendor}', but its "
-                        f"plugin ('{disabled_key}') is disabled in config. "
-                        f"Re-enable it with `hermes plugins enable {disabled_key}` "
-                        "(or remove it from plugins.disabled)."
-                    ),
-                }
-            else:
-                response_data = {
-                    "success": False,
-                    "error": (
-                        "No web search provider configured. "
-                        "Run `hermes tools` to set one up."
-                    ),
-                }
+        if disabled_key:
+            _vendor = disabled_key.split("/", 1)[-1]
+            response_data = {
+                "success": False,
+                "error": (
+                    f"web.search_backend is set to '{_vendor}', but its "
+                    f"plugin ('{disabled_key}') is disabled in config. "
+                    f"Re-enable it with `hermes plugins enable {disabled_key}` "
+                    "(or remove it from plugins.disabled)."
+                ),
+            }
+        elif provider is None:
+            response_data = {
+                "success": False,
+                "error": (
+                    "No web search provider configured. "
+                    "Run `hermes tools` to set one up."
+                ),
+            }
         else:
             logger.info(
                 "Web search via %s: '%s' (limit: %d)",
@@ -870,6 +870,23 @@ async def web_extract_tool(
                 _disabled_web_plugin_for,
             )
 
+            disabled_key = _disabled_web_plugin_for(capability="extract")
+            if disabled_key:
+                _vendor = disabled_key.split("/", 1)[-1]
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            f"web.extract_backend is set to '{_vendor}', "
+                            f"but its plugin ('{disabled_key}') is disabled "
+                            "in config. Re-enable it with "
+                            f"`hermes plugins enable {disabled_key}` "
+                            "(or remove it from plugins.disabled)."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+
             provider = _wsp_get_provider(backend) if backend else None
             if provider is None or not provider.supports_extract():
                 # When the configured name IS registered but doesn't support
@@ -898,22 +915,6 @@ async def web_extract_tool(
                     # and the real fix is to re-enable the plugin — say so
                     # instead of telling them to set web.extract_backend
                     # (which they already did). #40190 follow-up.
-                    disabled_key = _disabled_web_plugin_for(capability="extract")
-                    if disabled_key:
-                        _vendor = disabled_key.split("/", 1)[-1]
-                        return json.dumps(
-                            {
-                                "success": False,
-                                "error": (
-                                    f"web.extract_backend is set to '{_vendor}', "
-                                    f"but its plugin ('{disabled_key}') is disabled "
-                                    "in config. Re-enable it with "
-                                    f"`hermes plugins enable {disabled_key}` "
-                                    "(or remove it from plugins.disabled)."
-                                ),
-                            },
-                            ensure_ascii=False,
-                        )
                     return json.dumps(
                         {
                             "success": False,
