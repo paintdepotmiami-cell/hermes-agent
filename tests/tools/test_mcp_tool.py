@@ -2699,3 +2699,69 @@ class TestMCPDiscoveryCrossProcessLock:
                 os.unlink(lock_path)
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Regression: the CallToolResult error flag is spelled differently depending on
+# which package built the object. Both ship in the same environment:
+#
+#   mcp 1.28.1       -> CallToolResult.isError    (camelCase)
+#   mcp_types 2.0.0  -> CallToolResult.is_error   (snake_case, alias "isError")
+#
+# Reading only one name raises AttributeError against the other, and the call
+# dies before its result is ever inspected. Production symptom:
+#   "'CallToolResult' object has no attribute 'isError'"
+# which left the Supabase server unusable from Hermes Desktop.
+# ---------------------------------------------------------------------------
+
+def _make_call_result_snake(text="file contents here", is_error=False):
+    """CallToolResult as built by mcp_types 2.0.0: snake_case error flag."""
+    block = SimpleNamespace(text=text)
+    return SimpleNamespace(content=[block], is_error=is_error, structuredContent=None)
+
+
+class TestCallToolResultErrorFlagCompat:
+    """The tool handler must understand both CallToolResult models."""
+
+    def _patch_mcp_loop(self):
+        """Same as TestToolHandler: accepts a coroutine or a zero-arg factory."""
+        def fake_run(coro_or_factory, timeout=30):
+            coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+            return asyncio.run(coro)
+        return patch("tools.mcp_tool._run_on_mcp_loop", side_effect=fake_run)
+
+    def _call(self, result_obj):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(return_value=result_obj)
+        server = _make_mock_server("compat_srv", session=mock_session)
+        _servers["compat_srv"] = server
+        try:
+            handler = _make_tool_handler("compat_srv", "probe", 120)
+            with self._patch_mcp_loop():
+                return json.loads(handler({}))
+        finally:
+            _servers.pop("compat_srv", None)
+
+    def test_snake_case_success_is_not_treated_as_error(self):
+        """mcp_types exposes is_error; before the fix this raised AttributeError."""
+        result = self._call(_make_call_result_snake("ok", is_error=False))
+        assert result["result"] == "ok"
+        assert "error" not in result
+
+    def test_snake_case_error_is_surfaced_as_tool_error(self):
+        """A genuine tool failure must surface as an error, not as success."""
+        result = self._call(_make_call_result_snake("boom", is_error=True))
+        assert "boom" in json.dumps(result)
+        assert result.get("result") != "boom"
+
+    def test_camel_case_success_still_works(self):
+        """The mcp 1.28.1 path must not break when the fallback is added."""
+        result = self._call(_make_call_result("hello world", is_error=False))
+        assert result["result"] == "hello world"
+
+    def test_camel_case_error_still_works(self):
+        result = self._call(_make_call_result("kaboom", is_error=True))
+        assert "kaboom" in json.dumps(result)
+        assert result.get("result") != "kaboom"
